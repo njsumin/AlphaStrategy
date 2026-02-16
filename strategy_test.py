@@ -88,7 +88,7 @@ from conditions import (
     preset_funding_mr_buy, preset_funding_mr_sell,
     preset_union_buy, preset_alpha_combo,
 )
-from engine import load_data, backtest, print_results, print_trade_log, plot_results
+from engine import load_data, backtest, print_results, plot_results, save_results_to_files
 import pandas as pd
 
 
@@ -329,10 +329,14 @@ def main():
     bh_1y = ((df_1y["close"].iloc[-1] / df_1y["close"].iloc[0]) - 1) * 100 if len(df_1y) > 1 else 0
     print_results(results, buy_and_hold_ret=bh_ret, buy_and_hold_1y=bh_1y)
 
-    # Print trade logs for top 3
-    sorted_results = sorted(results, key=lambda x: x["total_return"], reverse=True)
-    for res in sorted_results[:3]:
-        print_trade_log(res)
+    # Save detailed results and trade logs to files
+    save_results_to_files(
+        results,
+        summary_path="d:/work/alpha_strategy/results_summary.txt",
+        trade_log_path="d:/work/alpha_strategy/trade_logs.txt",
+        buy_and_hold_ret=bh_ret,
+        buy_and_hold_1y=bh_1y,
+    )
 
     # ================================================================
     # PLOT

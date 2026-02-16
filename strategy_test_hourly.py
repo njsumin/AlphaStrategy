@@ -8,7 +8,8 @@ Other sources (F&G, derivatives): daily data expanded to hourly
   - hour 0-22: previous day's value (no intraday look-ahead)
   - hour 23: current day's value
 
-Indicator periods are auto-scaled by engine (e.g. RSI 14 -> 336 bars).
+RSI keeps bar-level periods (e.g. RSI 14 = 14 hours).
+Other indicators (SMA, drawdown, funding) are day-scaled (e.g. SMA200 = 4800 bars).
 
 Usage:
     python strategy_test_hourly.py
@@ -32,7 +33,7 @@ from conditions import (
     preset_funding_mr_buy, preset_funding_mr_sell,
     preset_union_buy, preset_alpha_combo,
 )
-from engine import load_data, backtest, print_results, print_trade_log, plot_results
+from engine import load_data, backtest, print_results, plot_results, save_results_to_files
 import pandas as pd
 
 
@@ -49,80 +50,231 @@ def main():
     )
 
     # ================================================================
-    # DEFINE STRATEGIES (same as daily, periods auto-scaled by engine)
+    # DEFINE STRATEGIES
+    # ================================================================
+    # Phase 1 结论: RSI(21,75/30) 是小时级最优基线
+    #   4772.6% return, 1.395 Sharpe, -28.7% MaxDD, 269 trades
+    # Phase 2: 围绕此基线应用 Step 1-7 优化
     # ================================================================
 
+    # RSI(21) 基线参数
+    P = 21   # RSI period (hours)
+    BT = 75  # buy threshold (RSI > BT)
+    ST = 30  # sell threshold (RSI < ST)
+
     strategies = [
-        # ------ BASELINES ------
-        {
-            "name": "F&G + RSI",
-            "buy_cond": preset_fg_rsi_buy(fg_thresh=10, rsi_thresh=35),
-            "sell_cond": preset_fg_rsi_sell(fg_thresh=92, rsi_thresh=65),
-        },
+        # ------ 对照组 ------
         {
             "name": "Funding MR",
             "buy_cond": preset_funding_mr_buy(thresh=-0.0001),
             "sell_cond": preset_funding_mr_sell(thresh=0.0003),
         },
 
-        # ------ REVERSE RSI ------
+        # ------ 基线 ------
         {
-            "name": "RevRSI Base",
-            "buy_cond": RSISellCond(threshold=70),
-            "sell_cond": RSIBuyCond(threshold=30),
+            "name": "H-RevRSI Base",
+            "buy_cond": RSISellCond(threshold=BT, period=P),
+            "sell_cond": RSIBuyCond(threshold=ST, period=P),
         },
+
+        # ------ Step 1: 止损 & Trailing Stop ------
         {
-            "name": "RevRSI+SL10%",
-            "buy_cond": RSISellCond(threshold=70),
-            "sell_cond": RSIBuyCond(threshold=30),
+            "name": "H-Rev+SL10%",
+            "buy_cond": RSISellCond(threshold=BT, period=P),
+            "sell_cond": RSIBuyCond(threshold=ST, period=P),
             "close_conditions": [StopLossCond(-0.10)],
         },
         {
-            "name": "RevRSI+Trail20%",
-            "buy_cond": RSISellCond(threshold=70),
-            "sell_cond": RSIBuyCond(threshold=30),
+            "name": "H-Rev+SL15%",
+            "buy_cond": RSISellCond(threshold=BT, period=P),
+            "sell_cond": RSIBuyCond(threshold=ST, period=P),
+            "close_conditions": [StopLossCond(-0.15)],
+        },
+        {
+            "name": "H-Rev+Trail10%",
+            "buy_cond": RSISellCond(threshold=BT, period=P),
+            "sell_cond": RSIBuyCond(threshold=ST, period=P),
+            "close_conditions": [TrailingStopCond(-0.10)],
+        },
+        {
+            "name": "H-Rev+Trail15%",
+            "buy_cond": RSISellCond(threshold=BT, period=P),
+            "sell_cond": RSIBuyCond(threshold=ST, period=P),
+            "close_conditions": [TrailingStopCond(-0.15)],
+        },
+        {
+            "name": "H-Rev+Trail20%",
+            "buy_cond": RSISellCond(threshold=BT, period=P),
+            "sell_cond": RSIBuyCond(threshold=ST, period=P),
             "close_conditions": [TrailingStopCond(-0.20)],
         },
+
+        # ------ Step 2: 止盈 & 时间退出 ------
         {
-            "name": "RevRSI+Trail20+TP200",
-            "buy_cond": RSISellCond(threshold=70),
-            "sell_cond": RSIBuyCond(threshold=30),
-            "close_conditions": [TrailingStopCond(-0.20), TakeProfitCond(2.0)],
+            "name": "H-Rev+TP200%",
+            "buy_cond": RSISellCond(threshold=BT, period=P),
+            "sell_cond": RSIBuyCond(threshold=ST, period=P),
+            "close_conditions": [TakeProfitCond(2.0)],
+        },
+        {
+            "name": "H-Rev+TP100%",
+            "buy_cond": RSISellCond(threshold=BT, period=P),
+            "sell_cond": RSIBuyCond(threshold=ST, period=P),
+            "close_conditions": [TakeProfitCond(1.0)],
+        },
+        {
+            "name": "H-Rev+Time90d",
+            "buy_cond": RSISellCond(threshold=BT, period=P),
+            "sell_cond": RSIBuyCond(threshold=ST, period=P),
+            "close_conditions": [TimeExitCond(max_days=90, min_profit=0.10)],
+        },
+        {
+            "name": "H-Rev+Time180d",
+            "buy_cond": RSISellCond(threshold=BT, period=P),
+            "sell_cond": RSIBuyCond(threshold=ST, period=P),
+            "close_conditions": [TimeExitCond(max_days=180, min_profit=0.10)],
         },
 
-        # ------ F&G sell enhancement ------
+        # ------ Step 3: F&G 卖出增强 ------
         {
-            "name": "RevRSI+FG90",
-            "buy_cond": RSISellCond(threshold=70),
+            "name": "H-Rev+FG85",
+            "buy_cond": RSISellCond(threshold=BT, period=P),
             "sell_cond": combine_conditions(
-                RSIBuyCond(threshold=30),
+                RSIBuyCond(threshold=ST, period=P),
+                FearGreedSellCond(threshold=85),
+                mode="OR"),
+        },
+        {
+            "name": "H-Rev+FG90",
+            "buy_cond": RSISellCond(threshold=BT, period=P),
+            "sell_cond": combine_conditions(
+                RSIBuyCond(threshold=ST, period=P),
                 FearGreedSellCond(threshold=90),
                 mode="OR"),
         },
 
-        # ------ Trend filter ------
+        # ------ Step 4: 趋势过滤 ------
         {
-            "name": "RevRSI+SMA200",
+            "name": "H-Rev+SMA50",
             "buy_cond": combine_conditions(
-                RSISellCond(threshold=70),
+                RSISellCond(threshold=BT, period=P),
+                TrendFilterCond(ma_period=50),
+                mode="AND"),
+            "sell_cond": RSIBuyCond(threshold=ST, period=P),
+        },
+        {
+            "name": "H-Rev+SMA100",
+            "buy_cond": combine_conditions(
+                RSISellCond(threshold=BT, period=P),
+                TrendFilterCond(ma_period=100),
+                mode="AND"),
+            "sell_cond": RSIBuyCond(threshold=ST, period=P),
+        },
+        {
+            "name": "H-Rev+SMA200",
+            "buy_cond": combine_conditions(
+                RSISellCond(threshold=BT, period=P),
                 TrendFilterCond(ma_period=200),
                 mode="AND"),
-            "sell_cond": RSIBuyCond(threshold=30),
+            "sell_cond": RSIBuyCond(threshold=ST, period=P),
         },
 
-        # ------ Optimized combo ------
+        # ------ Step 5: 衍生品过滤 ------
         {
-            "name": "RevRSI Optimized",
+            "name": "H-Rev+FundFilt",
             "buy_cond": combine_conditions(
-                RSISellCond(threshold=70),
-                TrendFilterCond(ma_period=200),
+                RSISellCond(threshold=BT, period=P),
+                FundingNotOverheatedCond(max_funding=0.0003),
                 mode="AND"),
-            "sell_cond": RSIBuyCond(threshold=30),
+            "sell_cond": RSIBuyCond(threshold=ST, period=P),
+        },
+        {
+            "name": "H-Rev+FundSell",
+            "buy_cond": combine_conditions(
+                RSISellCond(threshold=BT, period=P),
+                FundingNotOverheatedCond(max_funding=0.0003),
+                mode="AND"),
+            "sell_cond": combine_conditions(
+                RSIBuyCond(threshold=ST, period=P),
+                FundingSellCond(threshold=0.0003),
+                mode="OR"),
+        },
+
+        # ------ Step 6: RSI 动量方向 ------
+        {
+            "name": "H-Rev+Rising",
+            "buy_cond": combine_conditions(
+                RSISellCond(threshold=BT, period=P),
+                RSIRisingCond(min_delta=0, lookback=3),
+                mode="AND"),
+            "sell_cond": RSIBuyCond(threshold=ST, period=P),
+        },
+
+        # ------ Step 7: 组合优化 ------
+        {
+            "name": "H-Rev+SMA100+SL10",
+            "buy_cond": combine_conditions(
+                RSISellCond(threshold=BT, period=P),
+                TrendFilterCond(ma_period=100),
+                mode="AND"),
+            "sell_cond": RSIBuyCond(threshold=ST, period=P),
+            "close_conditions": [StopLossCond(-0.10)],
+        },
+        {
+            "name": "H-Rev+SMA100+Trail15",
+            "buy_cond": combine_conditions(
+                RSISellCond(threshold=BT, period=P),
+                TrendFilterCond(ma_period=100),
+                mode="AND"),
+            "sell_cond": RSIBuyCond(threshold=ST, period=P),
+            "close_conditions": [TrailingStopCond(-0.15)],
+        },
+        {
+            "name": "H-Rev+SMA100+FG90",
+            "buy_cond": combine_conditions(
+                RSISellCond(threshold=BT, period=P),
+                TrendFilterCond(ma_period=100),
+                mode="AND"),
+            "sell_cond": combine_conditions(
+                RSIBuyCond(threshold=ST, period=P),
+                FearGreedSellCond(threshold=90),
+                mode="OR"),
+        },
+        {
+            "name": "H-Rev+Fund+SMA100",
+            "buy_cond": combine_conditions(
+                RSISellCond(threshold=BT, period=P),
+                TrendFilterCond(ma_period=100),
+                FundingNotOverheatedCond(max_funding=0.0003),
+                mode="AND"),
+            "sell_cond": combine_conditions(
+                RSIBuyCond(threshold=ST, period=P),
+                FundingSellCond(threshold=0.0003),
+                mode="OR"),
+        },
+        {
+            "name": "H-Rev+Rising+SMA100",
+            "buy_cond": combine_conditions(
+                RSISellCond(threshold=BT, period=P),
+                TrendFilterCond(ma_period=100),
+                RSIRisingCond(min_delta=0, lookback=3),
+                mode="AND"),
+            "sell_cond": RSIBuyCond(threshold=ST, period=P),
+        },
+        {
+            "name": "H-Rev Full Combo",
+            "buy_cond": combine_conditions(
+                RSISellCond(threshold=BT, period=P),
+                TrendFilterCond(ma_period=100),
+                FundingNotOverheatedCond(max_funding=0.0003),
+                mode="AND"),
+            "sell_cond": combine_conditions(
+                RSIBuyCond(threshold=ST, period=P),
+                FundingSellCond(threshold=0.0003),
+                mode="OR"),
             "close_conditions": [StopLossCond(-0.10)],
         },
     ]
-
-    strategies.append(preset_alpha_combo())
 
     # ================================================================
     # RUN ALL STRATEGIES
@@ -149,10 +301,14 @@ def main():
     bh_1y = ((df_1y["close"].iloc[-1] / df_1y["close"].iloc[0]) - 1) * 100 if len(df_1y) > 1 else 0
     print_results(results, buy_and_hold_ret=bh_ret, buy_and_hold_1y=bh_1y)
 
-    # Print trade logs for top 3
-    sorted_results = sorted(results, key=lambda x: x["total_return"], reverse=True)
-    for res in sorted_results[:3]:
-        print_trade_log(res)
+    # Save detailed results and trade logs to files
+    save_results_to_files(
+        results,
+        summary_path="d:/work/alpha_strategy/results_hourly_summary.txt",
+        trade_log_path="d:/work/alpha_strategy/trade_logs_hourly.txt",
+        buy_and_hold_ret=bh_ret,
+        buy_and_hold_1y=bh_1y,
+    )
 
     # ================================================================
     # PLOT

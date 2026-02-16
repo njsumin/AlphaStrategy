@@ -61,7 +61,6 @@ def load_btc_price(start: str = "2018-01-01") -> pd.DataFrame:
     Returns:
         DataFrame with columns: date, open, close, volume
     """
-    print("Loading BTC price...")
     btc = yf.download("BTC-USD", start=start, progress=False)
     btc = btc.reset_index()
     if isinstance(btc.columns, pd.MultiIndex):
@@ -83,17 +82,15 @@ def load_fear_greed() -> pd.DataFrame:
         DataFrame with columns: date, fear_greed
         Empty DataFrame on failure.
     """
-    print("Loading Fear & Greed Index...")
     try:
         resp = requests.get("https://api.alternative.me/fng/?limit=0&format=json", timeout=15)
         fg_data = resp.json()["data"]
         fg_df = pd.DataFrame(fg_data)
         fg_df["date"] = pd.to_datetime(fg_df["timestamp"].astype(int), unit="s").dt.normalize()
         fg_df["fear_greed"] = fg_df["value"].astype(int)
-        print(f"  F&G: {fg_df['fear_greed'].notna().sum()} days loaded")
         return fg_df[["date", "fear_greed"]]
     except Exception as e:
-        print(f"  F&G failed: {e}")
+        print(f"Warning: F&G failed: {e}")
         return pd.DataFrame(columns=["date", "fear_greed"])
 
 
@@ -319,7 +316,6 @@ def load_coinbase_premium() -> pd.DataFrame:
         DataFrame with columns: date, coinbase_premium
         Empty DataFrame on failure.
     """
-    print("Loading Coinbase Premium (BTC-USD vs CME BTC=F)...")
     try:
         spot = yf.download("BTC-USD", period="max", progress=False).reset_index()
         futures = yf.download("BTC=F", period="max", progress=False).reset_index()
@@ -332,10 +328,9 @@ def load_coinbase_premium() -> pd.DataFrame:
         futures["date"] = pd.to_datetime(futures["date"]).dt.tz_localize(None).dt.normalize()
         m = pd.merge(spot[["date", "spot_close"]], futures[["date", "futures_close"]], on="date", how="inner")
         m["coinbase_premium"] = ((m["spot_close"] - m["futures_close"]) / m["futures_close"]) * 100
-        print(f"  CB Premium: {len(m)} days loaded")
         return m[["date", "coinbase_premium"]]
     except Exception as e:
-        print(f"  CB Premium failed: {e}")
+        print(f"Warning: CB Premium failed: {e}")
         return pd.DataFrame(columns=["date", "coinbase_premium"])
 
 
@@ -373,11 +368,8 @@ def load_all_data(start: str = "2018-01-01",
     if include_derivatives:
         deriv = load_derivatives_csv()
         if not deriv.empty:
-            print(f"Loading Binance derivatives...")
             df = pd.merge(df, deriv[["date", "funding_rate", "open_interest_usd"]], on="date", how="left")
-            print(f"  Derivatives: {len(deriv)} days loaded")
         else:
-            print(f"  Derivatives CSV not found: {BINANCE_CSV_PATH}")
             df["funding_rate"] = np.nan
             df["open_interest_usd"] = np.nan
 
@@ -497,9 +489,11 @@ def _fetch_binance_klines(symbol: str, interval: str,
         cursor_ms = data[-1][0] + 1
         time.sleep(_RATE_LIMIT_SLEEP)
 
-        if len(all_records) % 5000 < 1000:
-            print(f"  Fetched {len(all_records)} bars...")
+        if len(all_records) % 10000 < 1000:
+            print(f"  {len(all_records)} bars...", end="\r", flush=True)
 
+    if all_records:
+        print(f"  {len(all_records)} bars downloaded.     ")
     if not all_records:
         return pd.DataFrame(columns=["date", "open", "close", "volume"])
 
@@ -522,7 +516,6 @@ def load_btc_price_hourly(start: str = "2018-01-01") -> pd.DataFrame:
     Returns:
         DataFrame with columns: date, open, close, volume (hourly)
     """
-    print("Loading BTC price (hourly, Binance)...")
     start_dt = pd.Timestamp(start)
     now = pd.Timestamp.now()
     end_ms = int(now.timestamp() * 1000)
@@ -532,8 +525,6 @@ def load_btc_price_hourly(start: str = "2018-01-01") -> pd.DataFrame:
     if os.path.exists(_HOURLY_CSV_PATH):
         existing = pd.read_csv(_HOURLY_CSV_PATH)
         existing["date"] = pd.to_datetime(existing["date"])
-        print(f"  Cache: {len(existing)} bars "
-              f"({existing['date'].min()} ~ {existing['date'].max()})")
 
     # Determine fetch start
     if not existing.empty:
@@ -543,10 +534,9 @@ def load_btc_price_hourly(start: str = "2018-01-01") -> pd.DataFrame:
 
     # Fetch new data if needed (at least 2 hours gap)
     if fetch_start_ms < end_ms - 7_200_000:
-        print(f"  Fetching from {pd.Timestamp(fetch_start_ms, unit='ms')} ...")
+        print(f"Downloading BTC hourly data from Binance...")
         new_data = _fetch_binance_klines("BTCUSDT", "1h", fetch_start_ms, end_ms)
         if not new_data.empty:
-            print(f"  Downloaded {len(new_data)} new hourly bars")
             if not existing.empty:
                 result = pd.concat([existing, new_data], ignore_index=True)
                 result = result.drop_duplicates(subset="date", keep="last")
@@ -556,11 +546,9 @@ def load_btc_price_hourly(start: str = "2018-01-01") -> pd.DataFrame:
             # Save cache
             os.makedirs(_DATA_DIR, exist_ok=True)
             result.to_csv(_HOURLY_CSV_PATH, index=False)
-            print(f"  Saved cache: {_HOURLY_CSV_PATH} ({len(result)} bars)")
         else:
             result = existing
     else:
-        print(f"  Cache is up to date")
         result = existing
 
     if result.empty:
@@ -568,7 +556,6 @@ def load_btc_price_hourly(start: str = "2018-01-01") -> pd.DataFrame:
 
     # Filter to requested start date
     result = result[result["date"] >= start_dt].reset_index(drop=True)
-    print(f"  Total hourly BTC: {len(result)} bars")
     return result
 
 
@@ -599,16 +586,13 @@ def load_all_data_hourly(start: str = "2018-01-01",
     if include_derivatives:
         deriv = load_derivatives_csv()
         if not deriv.empty:
-            print(f"Loading Binance derivatives (hourly expand)...")
             deriv_hourly = _expand_daily_to_hourly(
                 deriv[["date", "funding_rate", "open_interest_usd"]],
                 date_col="date",
                 value_cols=["funding_rate", "open_interest_usd"],
             )
             df = pd.merge(df, deriv_hourly, on="date", how="left")
-            print(f"  Derivatives: {len(deriv)} days -> {len(deriv_hourly)} hourly bars")
         else:
-            print(f"  Derivatives CSV not found: {BINANCE_CSV_PATH}")
             df["funding_rate"] = np.nan
             df["open_interest_usd"] = np.nan
 

@@ -76,8 +76,7 @@ def load_data(start: str = "2018-01-01",
     df.attrs["bars_per_day"] = bars_per_day
 
     unit = "bars" if interval == "1h" else "days"
-    print(f"\nDataset ready: {len(df)} {unit} ({df['date'].min()} to {df['date'].max()})")
-    _print_coverage(df)
+    print(f"Dataset: {len(df)} {unit} ({df['date'].min()} ~ {df['date'].max()})")
     return df
 
 
@@ -321,46 +320,85 @@ def backtest(df: pd.DataFrame,
 # RESULTS DISPLAY
 # ============================================================================
 
-def print_results(results: list, buy_and_hold_ret: Optional[float] = None,
-                  buy_and_hold_1y: Optional[float] = None):
-    """
-    Print a formatted comparison table of strategy results.
-
-    Args:
-        results: List of result dicts from backtest().
-        buy_and_hold_ret: Optional B&H total return for comparison.
-        buy_and_hold_1y: Optional B&H last-year return for comparison.
-    """
+def _format_results_table(results: list, buy_and_hold_ret: Optional[float] = None,
+                          buy_and_hold_1y: Optional[float] = None) -> str:
+    """Format strategy results into a table string."""
     w = 130
-    print("\n" + "=" * w)
-    print(f"{'Strategy':<25} {'Return':>10} {'Sharpe':>8} {'MaxDD':>8} {'Trades':>7}"
-          f"  |  {'1Y Ret':>9} {'1Y Shrp':>8} {'1Y MDD':>8}")
-    print("-" * w)
+    lines = []
+    lines.append("=" * w)
+    lines.append(f"{'Strategy':<25} {'Return':>10} {'Sharpe':>8} {'MaxDD':>8} {'Trades':>7}"
+                 f"  |  {'1Y Ret':>9} {'1Y Shrp':>8} {'1Y MDD':>8}")
+    lines.append("-" * w)
     for res in results:
-        print(f"{res['name']:<25} {res['total_return']:>9.1f}% {res['sharpe']:>7.3f} "
-              f"{res['max_drawdown']:>7.1f}% {res['trades']:>6}"
-              f"  |  {res.get('return_1y', 0):>8.1f}% {res.get('sharpe_1y', 0):>7.3f} "
-              f"{res.get('max_drawdown_1y', 0):>7.1f}%")
+        lines.append(f"{res['name']:<25} {res['total_return']:>9.1f}% {res['sharpe']:>7.3f} "
+                     f"{res['max_drawdown']:>7.1f}% {res['trades']:>6}"
+                     f"  |  {res.get('return_1y', 0):>8.1f}% {res.get('sharpe_1y', 0):>7.3f} "
+                     f"{res.get('max_drawdown_1y', 0):>7.1f}%")
     if buy_and_hold_ret is not None:
         bh_1y_str = f"{buy_and_hold_1y:>8.1f}%" if buy_and_hold_1y is not None else f"{'N/A':>9}"
-        print(f"{'Buy & Hold':<25} {buy_and_hold_ret:>9.1f}%{'':>17}"
-              f"  |  {bh_1y_str}")
-    print("=" * w)
+        lines.append(f"{'Buy & Hold':<25} {buy_and_hold_ret:>9.1f}%{'':>17}"
+                     f"  |  {bh_1y_str}")
+    lines.append("=" * w)
 
     if results:
         best_s = max(results, key=lambda x: x["sharpe"])
         best_r = max(results, key=lambda x: x["total_return"])
-        print(f"\nBest Sharpe:  {best_s['name']} ({best_s['sharpe']:.3f})")
-        print(f"Best Return:  {best_r['name']} ({best_r['total_return']:.1f}%)")
+        lines.append(f"\nBest Sharpe:  {best_s['name']} ({best_s['sharpe']:.3f})")
+        lines.append(f"Best Return:  {best_r['name']} ({best_r['total_return']:.1f}%)")
+    return "\n".join(lines)
+
+
+def _format_trade_log(result: dict) -> str:
+    """Format trade log for a single strategy."""
+    lines = []
+    lines.append(f"\n--- {result['name']} ({result['trades']} entries, {result['total_return']:.0f}%) ---")
+    for t in result["trade_log"]:
+        src = t.get("source", "")
+        date_str = t['date'].strftime('%Y-%m-%d %H:%M') if hasattr(t['date'], 'hour') and t['date'].hour != 0 else t['date'].strftime('%Y-%m-%d')
+        lines.append(f"  {t['type']:>4} | {date_str} | "
+                     f"${t['price']:>10,.0f} | Cap: ${t['capital']:>10,.0f} | {src}")
+    return "\n".join(lines)
+
+
+def print_results(results: list, buy_and_hold_ret: Optional[float] = None,
+                  buy_and_hold_1y: Optional[float] = None):
+    """Print a formatted comparison table of strategy results to console."""
+    print("\n" + _format_results_table(results, buy_and_hold_ret, buy_and_hold_1y))
 
 
 def print_trade_log(result: dict):
     """Print detailed trade log for a single strategy result."""
-    print(f"\n--- {result['name']} ({result['trades']} entries, {result['total_return']:.0f}%) ---")
-    for t in result["trade_log"]:
-        src = t.get("source", "")
-        print(f"  {t['type']:>4} | {t['date'].strftime('%Y-%m-%d')} | "
-              f"${t['price']:>10,.0f} | Cap: ${t['capital']:>10,.0f} | {src}")
+    print(_format_trade_log(result))
+
+
+def save_results_to_files(results: list,
+                          summary_path: str,
+                          trade_log_path: str,
+                          buy_and_hold_ret: Optional[float] = None,
+                          buy_and_hold_1y: Optional[float] = None):
+    """
+    Save strategy results summary and trade logs to separate files.
+
+    Args:
+        results: List of result dicts from backtest().
+        summary_path: Path to save the results summary table.
+        trade_log_path: Path to save the trade logs.
+        buy_and_hold_ret: Optional B&H total return.
+        buy_and_hold_1y: Optional B&H last-year return.
+    """
+    # Summary file
+    with open(summary_path, "w", encoding="utf-8") as f:
+        f.write(_format_results_table(results, buy_and_hold_ret, buy_and_hold_1y))
+        f.write("\n")
+    print(f"Results saved to {summary_path}")
+
+    # Trade log file — all strategies sorted by return
+    sorted_results = sorted(results, key=lambda x: x["total_return"], reverse=True)
+    with open(trade_log_path, "w", encoding="utf-8") as f:
+        for res in sorted_results:
+            f.write(_format_trade_log(res))
+            f.write("\n")
+    print(f"Trade logs saved to {trade_log_path}")
 
 
 # ============================================================================
