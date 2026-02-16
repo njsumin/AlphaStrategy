@@ -67,12 +67,13 @@ def load_data(start: str = "2018-01-01",
 
 def _add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """Compute all technical indicators from raw data columns."""
-    # RSI-14
-    delta = df["close"].diff()
-    gain = delta.where(delta > 0, 0).rolling(14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-    rs = gain / loss
-    df["rsi_14"] = 100 - (100 / (1 + rs))
+    # RSI multi-period
+    for period in [7, 10, 14, 21]:
+        delta = df["close"].diff()
+        gain = delta.where(delta > 0, 0).rolling(period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(period).mean()
+        rs = gain / loss
+        df[f"rsi_{period}"] = 100 - (100 / (1 + rs))
 
     # Coinbase Premium SMA7
     if "coinbase_premium" in df.columns:
@@ -93,6 +94,13 @@ def _add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     for lookback in [30, 60, 90]:
         high = df["close"].rolling(lookback).max()
         df[f"drawdown_{lookback}d"] = (df["close"] - high) / high
+
+    # Trend SMAs
+    for ma_period in [50, 100, 200]:
+        df[f"sma_{ma_period}"] = df["close"].rolling(ma_period).mean()
+
+    # RSI momentum direction (3-day change)
+    df["rsi_14_delta3"] = df["rsi_14"].diff(3)
 
     return df
 

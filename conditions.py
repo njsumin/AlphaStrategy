@@ -214,6 +214,82 @@ class PriceDropBuyCond:
         return f"PriceDropBuyCond(threshold={self.threshold}, lookback={self.lookback})"
 
 
+class TrendFilterCond:
+    """
+    Trend filter: True when close > SMA(N) (uptrend confirmed).
+
+    Args:
+        ma_period (int): Moving average period. Default=200.
+
+    Required columns: sma_{ma_period}
+    """
+    def __init__(self, ma_period: int = 200):
+        self.ma_period = ma_period
+        self.col = f"sma_{ma_period}"
+        self.name = f"Close>SMA{ma_period}"
+
+    def __call__(self, row: pd.Series) -> ConditionResult:
+        sma = row.get(self.col, np.nan)
+        close = row.get("close", np.nan)
+        if pd.isna(sma) or pd.isna(close):
+            return False
+        return self.name if close > sma else False
+
+    def __repr__(self):
+        return f"TrendFilterCond(ma_period={self.ma_period})"
+
+
+class FundingNotOverheatedCond:
+    """
+    Buy filter: True when Funding Rate SMA7 is below max threshold (not overheated).
+
+    Args:
+        max_funding (float): Upper limit. Default=0.0003 (0.03%/8h).
+
+    Required columns: funding_sma7
+    Note: Returns True (pass-through) when data is missing.
+    """
+    def __init__(self, max_funding: float = 0.0003):
+        self.max_funding = max_funding
+        self.name = f"Fund<{max_funding*100:.2f}%"
+
+    def __call__(self, row: pd.Series) -> ConditionResult:
+        f = row.get("funding_sma7", np.nan)
+        if pd.isna(f):
+            return self.name  # No data = don't filter
+        return self.name if f < self.max_funding else False
+
+    def __repr__(self):
+        return f"FundingNotOverheatedCond(max_funding={self.max_funding})"
+
+
+class RSIRisingCond:
+    """
+    RSI direction filter: True when RSI has risen by at least min_delta over lookback days.
+
+    Args:
+        min_delta (float): Minimum RSI change. Default=0 (any rise).
+        lookback (int): Days for diff. Default=3.
+        rsi_period (int): RSI period. Default=14.
+
+    Required columns: rsi_{rsi_period}_delta{lookback}
+    """
+    def __init__(self, min_delta: float = 0.0, lookback: int = 3, rsi_period: int = 14):
+        self.min_delta = min_delta
+        self.lookback = lookback
+        self.col = f"rsi_{rsi_period}_delta{lookback}"
+        self.name = f"RSI_d{lookback}>{min_delta:.0f}"
+
+    def __call__(self, row: pd.Series) -> ConditionResult:
+        d = row.get(self.col, np.nan)
+        if pd.isna(d):
+            return False
+        return self.name if d > self.min_delta else False
+
+    def __repr__(self):
+        return f"RSIRisingCond(min_delta={self.min_delta}, lookback={self.lookback})"
+
+
 # ============================================================================
 # SELL CONDITIONS
 # ============================================================================

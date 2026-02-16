@@ -74,6 +74,8 @@ from conditions import (
     # Buy conditions
     FearGreedBuyCond, RSIBuyCond, FundingBuyCond, OIDropBuyCond,
     CBPremiumBuyCond, PriceDropBuyCond,
+    # Filters
+    TrendFilterCond, FundingNotOverheatedCond, RSIRisingCond,
     # Sell conditions
     FearGreedSellCond, RSISellCond, FundingSellCond, OISurgeSellCond,
     CBPremiumSellCond,
@@ -191,9 +193,115 @@ def main():
             "sell_cond": RSIBuyCond(threshold=30),
             "close_conditions": [StopLossCond(-0.10)],
         },
+
+        # ------ Step 1: Trailing Stop 系列 ------
+        {
+            "name": "RevRSI+Trail15%",
+            "buy_cond": RSISellCond(threshold=70),
+            "sell_cond": RSIBuyCond(threshold=30),
+            "close_conditions": [TrailingStopCond(-0.15)],
+        },
+        {
+            "name": "RevRSI+Trail20%",
+            "buy_cond": RSISellCond(threshold=70),
+            "sell_cond": RSIBuyCond(threshold=30),
+            "close_conditions": [TrailingStopCond(-0.20)],
+        },
+        {
+            "name": "RevRSI+Trail20+TP200",
+            "buy_cond": RSISellCond(threshold=70),
+            "sell_cond": RSIBuyCond(threshold=30),
+            "close_conditions": [TrailingStopCond(-0.20), TakeProfitCond(2.0)],
+        },
+        {
+            "name": "RevRSI+Time180d",
+            "buy_cond": RSISellCond(threshold=70),
+            "sell_cond": RSIBuyCond(threshold=30),
+            "close_conditions": [TimeExitCond(max_days=180, min_profit=0.10)],
+        },
+
+        # ------ Step 2: F&G 卖出增强 ------
+        {
+            "name": "RevRSI+FG85",
+            "buy_cond": RSISellCond(threshold=70),
+            "sell_cond": combine_conditions(
+                RSIBuyCond(threshold=30),
+                FearGreedSellCond(threshold=85),
+                mode="OR"),
+        },
+        {
+            "name": "RevRSI+FG90",
+            "buy_cond": RSISellCond(threshold=70),
+            "sell_cond": combine_conditions(
+                RSIBuyCond(threshold=30),
+                FearGreedSellCond(threshold=90),
+                mode="OR"),
+        },
+        # ------ Step 3: 趋势过滤 ------
+        {
+            "name": "RevRSI+SMA200",
+            "buy_cond": combine_conditions(
+                RSISellCond(threshold=70),
+                TrendFilterCond(ma_period=200),
+                mode="AND"),
+            "sell_cond": RSIBuyCond(threshold=30),
+        },
+        {
+            "name": "RevRSI+SMA100",
+            "buy_cond": combine_conditions(
+                RSISellCond(threshold=70),
+                TrendFilterCond(ma_period=100),
+                mode="AND"),
+            "sell_cond": RSIBuyCond(threshold=30),
+        },
+
+        # ------ Step 5: 衍生品过滤 ------
+        {
+            "name": "RevRSI+FundFilter",
+            "buy_cond": combine_conditions(
+                RSISellCond(threshold=70),
+                FundingNotOverheatedCond(max_funding=0.0003),
+                mode="AND"),
+            "sell_cond": combine_conditions(
+                RSIBuyCond(threshold=30),
+                FundingSellCond(threshold=0.0003),
+                mode="OR"),
+        },
+
+        # ------ Step 6: RSI 动量方向过滤 ------
+        {
+            "name": "RevRSI+Rising",
+            "buy_cond": combine_conditions(
+                RSISellCond(threshold=70),
+                RSIRisingCond(min_delta=0, lookback=3),
+                mode="AND"),
+            "sell_cond": RSIBuyCond(threshold=30),
+        },
+        # ------ Step 7: 最优组合整合 ------
+        {
+            "name": "RevRSI Optimized",
+            "buy_cond": combine_conditions(
+                RSISellCond(threshold=70),
+                TrendFilterCond(ma_period=200),
+                mode="AND"),
+            "sell_cond": RSIBuyCond(threshold=30),
+            "close_conditions": [StopLossCond(-0.10)],
+        },
     ]
 
     strategies.append(preset_alpha_combo())
+
+    # ------ Step 4: RSI 参数扫描 ------
+    for period in [7, 10, 14, 21]:
+        for buy_th in [65, 70, 75]:
+            for sell_th in [25, 30, 35]:
+                if period == 14 and buy_th == 70 and sell_th == 30:
+                    continue  # 跳过已有的 Base 配置
+                strategies.append({
+                    "name": f"RevRSI({period},{buy_th}/{sell_th})",
+                    "buy_cond": RSISellCond(threshold=buy_th, period=period),
+                    "sell_cond": RSIBuyCond(threshold=sell_th, period=period),
+                })
 
     # ================================================================
     # RUN ALL STRATEGIES
