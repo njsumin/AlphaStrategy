@@ -20,7 +20,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from typing import Optional, List, Callable, Union
-from data_loader import load_all_data
+from data_loader import load_all_data, load_all_data_hourly
 
 
 # ============================================================================
@@ -31,6 +31,7 @@ def load_data(start: str = "2018-01-01",
               include_fg: bool = True,
               include_derivatives: bool = True,
               include_cb_premium: bool = False,
+              interval: str = "1d",
               ) -> pd.DataFrame:
     """
     Load all data sources and compute indicators.
@@ -43,31 +44,55 @@ def load_data(start: str = "2018-01-01",
         include_fg: Include Fear & Greed Index.
         include_derivatives: Include Binance Funding Rate and OI.
         include_cb_premium: Include Coinbase Premium proxy.
+        interval: "1d" for daily, "1h" for hourly.
 
     Returns:
         DataFrame with columns: date, open, close, fear_greed, funding_rate,
         open_interest_usd, coinbase_premium, rsi_14, funding_sma7,
         cb_prem_sma7, oi_pct_7d, oi_valid, drawdown_30d, etc.
     """
-    df = load_all_data(
-        start=start,
-        include_fg=include_fg,
-        include_derivatives=include_derivatives,
-        include_cb_premium=include_cb_premium,
-    )
+    if interval == "1h":
+        df = load_all_data_hourly(
+            start=start,
+            include_fg=include_fg,
+            include_derivatives=include_derivatives,
+            include_cb_premium=include_cb_premium,
+        )
+        bars_per_day = 24
+    else:
+        df = load_all_data(
+            start=start,
+            include_fg=include_fg,
+            include_derivatives=include_derivatives,
+            include_cb_premium=include_cb_premium,
+        )
+        bars_per_day = 1
 
     # Compute indicators
-    df = _add_indicators(df)
+    df = _add_indicators(df, bars_per_day=bars_per_day)
     df = df.dropna(subset=["rsi_14"]).reset_index(drop=True)
 
-    print(f"\nDataset ready: {len(df)} days ({df['date'].min().date()} to {df['date'].max().date()})")
+    # Store bars_per_day in DataFrame metadata so backtest can use it
+    df.attrs["bars_per_day"] = bars_per_day
+
+    unit = "bars" if interval == "1h" else "days"
+    print(f"\nDataset ready: {len(df)} {unit} ({df['date'].min()} to {df['date'].max()})")
     _print_coverage(df)
     return df
 
 
-def _add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute all technical indicators from raw data columns."""
-    # RSI multi-period
+def _add_indicators(df: pd.DataFrame, bars_per_day: int = 1) -> pd.DataFrame:
+    """
+    Compute all technical indicators from raw data columns.
+
+    Args:
+        bars_per_day: 1 for daily data, 24 for hourly. All day-based periods
+                      are multiplied by this factor so indicators retain
+                      the same calendar-time meaning.
+    """
+    bpd = bars_per_day
+
+    # RSI multi-period (keep bar-level periods, not calendar-day scaled)
     for period in [7, 10, 14, 21]:
         delta = df["close"].diff()
         gain = delta.where(delta > 0, 0).rolling(period).mean()
@@ -77,29 +102,32 @@ def _add_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
     # Coinbase Premium SMA7
     if "coinbase_premium" in df.columns:
-        df["coinbase_premium"] = df["coinbase_premium"].ffill(limit=3)
-        df["cb_prem_sma7"] = df["coinbase_premium"].rolling(7, min_periods=5).mean()
+        df["coinbase_premium"] = df["coinbase_premium"].ffill(limit=3 * bpd)
+        df["cb_prem_sma7"] = df["coinbase_premium"].rolling(
+            7 * bpd, min_periods=5 * bpd).mean()
 
     # Funding SMA7
     if "funding_rate" in df.columns:
-        df["funding_rate"] = df["funding_rate"].ffill(limit=3)
-        df["funding_sma7"] = df["funding_rate"].rolling(7, min_periods=5).mean()
+        df["funding_rate"] = df["funding_rate"].ffill(limit=3 * bpd)
+        df["funding_sma7"] = df["funding_rate"].rolling(
+            7 * bpd, min_periods=5 * bpd).mean()
 
     # OI metrics
     if "open_interest_usd" in df.columns:
         df["oi_valid"] = df["open_interest_usd"] > 0
-        df["oi_pct_7d"] = df["open_interest_usd"].pct_change(periods=7, fill_method=None)
+        df["oi_pct_7d"] = df["open_interest_usd"].pct_change(
+            periods=7 * bpd, fill_method=None)
 
     # Drawdowns from recent high
     for lookback in [30, 60, 90]:
-        high = df["close"].rolling(lookback).max()
+        high = df["close"].rolling(lookback * bpd).max()
         df[f"drawdown_{lookback}d"] = (df["close"] - high) / high
 
     # Trend SMAs
     for ma_period in [50, 100, 200]:
-        df[f"sma_{ma_period}"] = df["close"].rolling(ma_period).mean()
+        df[f"sma_{ma_period}"] = df["close"].rolling(ma_period * bpd).mean()
 
-    # RSI momentum direction (3-day change)
+    # RSI momentum direction (3-bar change, matches RSI bar-level granularity)
     df["rsi_14_delta3"] = df["rsi_14"].diff(3)
 
     return df
@@ -126,7 +154,8 @@ def backtest(df: pd.DataFrame,
              close_conditions: Optional[list] = None,
              source_aware_sell: bool = False,
              sell_map: Optional[dict] = None,
-             initial_capital: float = 10000.0) -> dict:
+             initial_capital: float = 10000.0,
+             bars_per_day: int = 0) -> dict:
     """
     Run a backtest with configurable buy/sell/close conditions.
 
@@ -142,17 +171,20 @@ def backtest(df: pd.DataFrame,
         sell_map: Dict mapping entry source label -> sell condition function.
             Example: {"FG<10+RSI<35": fg_rsi_sell, "Fund<-0.01%": funding_sell}
         initial_capital: Starting capital in USD.
+        bars_per_day: 1 for daily, 24 for hourly. 0 = auto-detect from df.attrs.
 
     Returns:
         dict with keys: name, total_return, sharpe, max_drawdown, trades,
         trade_log, portfolio (DataFrame)
 
     Execution model (no look-ahead bias):
-        - Signals are evaluated using day T's close-based indicators.
-        - Trades execute at day T+1's open price.
-        - Close conditions (stop-loss, etc.) use day T's close for evaluation,
+        - Signals are evaluated using bar T's close-based indicators.
+        - Trades execute at bar T+1's open price.
+        - Close conditions (stop-loss, etc.) use bar T's close for evaluation,
           but also execute at T+1 open.
     """
+    if bars_per_day == 0:
+        bars_per_day = df.attrs.get("bars_per_day", 1)
     capital = initial_capital
     position = 0  # 0=cash, 1=holding
     btc_held = 0.0
@@ -224,7 +256,7 @@ def backtest(df: pd.DataFrame,
 
             # Check close conditions
             if not should_sell and close_conditions:
-                days_held = (date - entry_date).days if entry_date else 0
+                days_held = (date - entry_date).total_seconds() / 86400 if entry_date else 0
                 for cc in close_conditions:
                     if hasattr(cc, 'check'):
                         import inspect
@@ -255,7 +287,8 @@ def backtest(df: pd.DataFrame,
     pv = pd.DataFrame(portfolio)
     ret = ((capital - initial_capital) / initial_capital) * 100
     daily_ret = pv["value"].pct_change().dropna()
-    sharpe = (daily_ret.mean() / daily_ret.std()) * np.sqrt(365) if daily_ret.std() > 0 else 0
+    annualize = np.sqrt(365 * bars_per_day)
+    sharpe = (daily_ret.mean() / daily_ret.std()) * annualize if daily_ret.std() > 0 else 0
     max_dd = ((pv["value"] - pv["value"].cummax()) / pv["value"].cummax()).min() * 100
 
     # Last 1 year metrics
@@ -265,7 +298,7 @@ def backtest(df: pd.DataFrame,
     if len(pv_1y) > 1:
         ret_1y = ((pv_1y["value"].iloc[-1] / pv_1y["value"].iloc[0]) - 1) * 100
         dr_1y = pv_1y["value"].pct_change().dropna()
-        sharpe_1y = (dr_1y.mean() / dr_1y.std()) * np.sqrt(365) if dr_1y.std() > 0 else 0
+        sharpe_1y = (dr_1y.mean() / dr_1y.std()) * annualize if dr_1y.std() > 0 else 0
         dd_1y = ((pv_1y["value"] - pv_1y["value"].cummax()) / pv_1y["value"].cummax()).min() * 100
     else:
         ret_1y, sharpe_1y, dd_1y = 0.0, 0.0, 0.0

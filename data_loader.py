@@ -393,6 +393,239 @@ def load_all_data(start: str = "2018-01-01",
 
 
 # ============================================================================
+# 6. HOURLY DATA SUPPORT
+# ============================================================================
+
+def _expand_daily_to_hourly(df: pd.DataFrame,
+                            date_col: str = "date",
+                            value_cols: list = None) -> pd.DataFrame:
+    """
+    Expand daily data to hourly (24 rows per day).
+
+    Fill rule (avoids intraday look-ahead bias):
+      - hour 0-22: previous day's value
+      - hour 23:   current day's value
+
+    For the very first day there is no previous day, so all 24 hours
+    use that day's value.
+
+    Args:
+        df: DataFrame with a date column (daily granularity) and value columns.
+        date_col: Name of the date column.
+        value_cols: Columns to expand. If None, all columns except date_col.
+
+    Returns:
+        DataFrame with datetime index at hourly granularity.
+    """
+    if value_cols is None:
+        value_cols = [c for c in df.columns if c != date_col]
+
+    df = df.sort_values(date_col).reset_index(drop=True)
+    rows = []
+    prev_values = None
+
+    for _, row in df.iterrows():
+        day = pd.Timestamp(row[date_col]).normalize()
+        cur_values = {c: row[c] for c in value_cols}
+
+        for h in range(24):
+            dt = day + pd.Timedelta(hours=h)
+            if h < 23:
+                vals = prev_values if prev_values is not None else cur_values
+            else:
+                vals = cur_values
+            entry = {date_col: dt}
+            entry.update(vals)
+            rows.append(entry)
+
+        prev_values = cur_values
+
+    return pd.DataFrame(rows)
+
+
+def _fetch_binance_klines(symbol: str, interval: str,
+                          start_ms: int, end_ms: int,
+                          max_workers: int = 5) -> pd.DataFrame:
+    """
+    Fetch historical klines from Binance spot API in batches.
+
+    Binance /api/v3/klines returns up to 1000 bars per request.
+    We paginate forward until end_ms is reached.
+
+    Args:
+        symbol: e.g. "BTCUSDT"
+        interval: e.g. "1h", "1d"
+        start_ms: Start timestamp in milliseconds.
+        end_ms: End timestamp in milliseconds.
+        max_workers: Not used for sequential fetch (kept for signature compat).
+
+    Returns:
+        DataFrame with columns: date, open, close, volume
+    """
+    base_url = "https://api.binance.com/api/v3/klines"
+    all_records = []
+    cursor_ms = start_ms
+
+    while cursor_ms < end_ms:
+        params = {
+            "symbol": symbol,
+            "interval": interval,
+            "startTime": cursor_ms,
+            "endTime": end_ms,
+            "limit": 1000,
+        }
+        try:
+            resp = requests.get(base_url, params=params, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            print(f"  Binance klines error: {e}")
+            break
+
+        if not data:
+            break
+
+        for row in data:
+            all_records.append({
+                "date": pd.Timestamp(row[0], unit="ms"),
+                "open": float(row[1]),
+                "close": float(row[4]),
+                "volume": float(row[5]),
+            })
+
+        # Move cursor past the last candle's open time
+        cursor_ms = data[-1][0] + 1
+        time.sleep(_RATE_LIMIT_SLEEP)
+
+        if len(all_records) % 5000 < 1000:
+            print(f"  Fetched {len(all_records)} bars...")
+
+    if not all_records:
+        return pd.DataFrame(columns=["date", "open", "close", "volume"])
+
+    df = pd.DataFrame(all_records)
+    df = df.drop_duplicates(subset="date").sort_values("date").reset_index(drop=True)
+    return df
+
+
+_HOURLY_CSV_PATH = os.path.join(_DATA_DIR, "btc_hourly.csv")
+
+
+def load_btc_price_hourly(start: str = "2018-01-01") -> pd.DataFrame:
+    """
+    Load BTC-USDT hourly OHLCV from Binance API with local CSV cache.
+
+    On first call, downloads full history from Binance spot klines API
+    and caches to data/binance/btc_hourly.csv. Subsequent calls do
+    incremental updates from the last cached timestamp.
+
+    Returns:
+        DataFrame with columns: date, open, close, volume (hourly)
+    """
+    print("Loading BTC price (hourly, Binance)...")
+    start_dt = pd.Timestamp(start)
+    now = pd.Timestamp.now()
+    end_ms = int(now.timestamp() * 1000)
+
+    # Load existing cache
+    existing = pd.DataFrame()
+    if os.path.exists(_HOURLY_CSV_PATH):
+        existing = pd.read_csv(_HOURLY_CSV_PATH)
+        existing["date"] = pd.to_datetime(existing["date"])
+        print(f"  Cache: {len(existing)} bars "
+              f"({existing['date'].min()} ~ {existing['date'].max()})")
+
+    # Determine fetch start
+    if not existing.empty:
+        fetch_start_ms = int(existing["date"].max().timestamp() * 1000) + 1
+    else:
+        fetch_start_ms = int(start_dt.timestamp() * 1000)
+
+    # Fetch new data if needed (at least 2 hours gap)
+    if fetch_start_ms < end_ms - 7_200_000:
+        print(f"  Fetching from {pd.Timestamp(fetch_start_ms, unit='ms')} ...")
+        new_data = _fetch_binance_klines("BTCUSDT", "1h", fetch_start_ms, end_ms)
+        if not new_data.empty:
+            print(f"  Downloaded {len(new_data)} new hourly bars")
+            if not existing.empty:
+                result = pd.concat([existing, new_data], ignore_index=True)
+                result = result.drop_duplicates(subset="date", keep="last")
+                result = result.sort_values("date").reset_index(drop=True)
+            else:
+                result = new_data
+            # Save cache
+            os.makedirs(_DATA_DIR, exist_ok=True)
+            result.to_csv(_HOURLY_CSV_PATH, index=False)
+            print(f"  Saved cache: {_HOURLY_CSV_PATH} ({len(result)} bars)")
+        else:
+            result = existing
+    else:
+        print(f"  Cache is up to date")
+        result = existing
+
+    if result.empty:
+        return pd.DataFrame(columns=["date", "open", "close", "volume"])
+
+    # Filter to requested start date
+    result = result[result["date"] >= start_dt].reset_index(drop=True)
+    print(f"  Total hourly BTC: {len(result)} bars")
+    return result
+
+
+def load_all_data_hourly(start: str = "2018-01-01",
+                         include_fg: bool = True,
+                         include_derivatives: bool = True,
+                         include_cb_premium: bool = False) -> pd.DataFrame:
+    """
+    Load and merge all data sources at hourly granularity.
+
+    BTC price uses real hourly data where available, daily-expanded elsewhere.
+    Other sources (F&G, derivatives, CB premium) are always daily-expanded.
+
+    Returns:
+        DataFrame with hourly rows and all requested columns.
+    """
+    df = load_btc_price_hourly(start)
+
+    if include_fg:
+        fg_df = load_fear_greed()
+        if not fg_df.empty:
+            fg_hourly = _expand_daily_to_hourly(fg_df, date_col="date",
+                                                value_cols=["fear_greed"])
+            df = pd.merge(df, fg_hourly, on="date", how="left")
+        else:
+            df["fear_greed"] = np.nan
+
+    if include_derivatives:
+        deriv = load_derivatives_csv()
+        if not deriv.empty:
+            print(f"Loading Binance derivatives (hourly expand)...")
+            deriv_hourly = _expand_daily_to_hourly(
+                deriv[["date", "funding_rate", "open_interest_usd"]],
+                date_col="date",
+                value_cols=["funding_rate", "open_interest_usd"],
+            )
+            df = pd.merge(df, deriv_hourly, on="date", how="left")
+            print(f"  Derivatives: {len(deriv)} days -> {len(deriv_hourly)} hourly bars")
+        else:
+            print(f"  Derivatives CSV not found: {BINANCE_CSV_PATH}")
+            df["funding_rate"] = np.nan
+            df["open_interest_usd"] = np.nan
+
+    if include_cb_premium:
+        cb_df = load_coinbase_premium()
+        if not cb_df.empty:
+            cb_hourly = _expand_daily_to_hourly(cb_df, date_col="date",
+                                                value_cols=["coinbase_premium"])
+            df = pd.merge(df, cb_hourly, on="date", how="left")
+        else:
+            df["coinbase_premium"] = np.nan
+
+    df = df.sort_values("date").reset_index(drop=True)
+    return df
+
+
+# ============================================================================
 # CLI: python data_loader.py [--full]
 # ============================================================================
 
