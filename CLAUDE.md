@@ -29,6 +29,9 @@ pip install pandas numpy matplotlib yfinance requests python-dateutil
 - 新策略参考 strategy_test.py 中的现有配置
 - 尽可能保持现有结构，保持代码的可重用性
 - 所有数据下载/网络请求逻辑集中在 data_loader.py，engine.py 不做网络调用
+- 所有程序console只输出最重要的结果，交易信息/日志放入单独的两个文件里
+- 查日志/交易数据等用grep/find/head/tail，不要一次打开大文件
+
 
 ## 核心规则（违反即 bug）
 
@@ -43,7 +46,7 @@ pip install pandas numpy matplotlib yfinance requests python-dateutil
 之前三十天的close价格是1.1-1.2之间，之后给出20-30之间的数据，在数据跳变前的最后一个日期的指标不应该有大异常
 
 ### 回测必须包含
-关键指标（夏普比率、最大回撤、胜率）
+关键指标（夏普比率、最大回撤、胜率, profit R Square, 最近一年的收益，夏普比率、最大回撤、胜率）
 
 ## 开发工作流
 1. **数据下载后** → 立即验证：缺失值、重复时间戳、价格异常值（3σ），生成数据质量报告，对于合理的缺失例如周末等自动补全数据

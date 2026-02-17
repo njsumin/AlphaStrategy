@@ -129,6 +129,109 @@ def _add_indicators(df: pd.DataFrame, bars_per_day: int = 1) -> pd.DataFrame:
     # RSI momentum direction (3-bar change, matches RSI bar-level granularity)
     df["rsi_14_delta3"] = df["rsi_14"].diff(3)
 
+    # Volume Profile (rolling window, multiple lookbacks)
+    if "volume" in df.columns and df["volume"].notna().any():
+        for vp_days in [3, 7, 14]:
+            df = _add_volume_profile(df, bars_per_day=bpd, window_days=vp_days)
+
+    return df
+
+
+def _add_volume_profile(df: pd.DataFrame, bars_per_day: int = 24,
+                         window_days: int = 7, n_bins: int = 50,
+                         value_area_pct: float = 0.70) -> pd.DataFrame:
+    """
+    Compute rolling Volume Profile indicators: POC, VAH, VAL.
+
+    For each bar, looks back `window_days * bars_per_day` bars, distributes
+    volume into price bins, finds POC (max volume bin), then expands outward
+    from POC until value_area_pct of total volume is covered.
+
+    Args:
+        df: DataFrame with 'close' and 'volume' columns.
+        bars_per_day: 1 for daily, 24 for hourly.
+        window_days: Lookback window in calendar days.
+        n_bins: Number of price bins for the profile.
+        value_area_pct: Fraction of volume for value area (default 70%).
+
+    Adds columns: vp_poc_{window_days}d, vp_vah_{window_days}d, vp_val_{window_days}d
+    """
+    window = window_days * bars_per_day
+    closes = df["close"].values
+    volumes = df["volume"].values
+    n = len(df)
+
+    vp_poc = np.full(n, np.nan)
+    vp_vah = np.full(n, np.nan)
+    vp_val = np.full(n, np.nan)
+
+    for i in range(window, n):
+        c = closes[i - window:i]
+        v = volumes[i - window:i]
+
+        # Skip if insufficient data
+        valid = ~np.isnan(c) & ~np.isnan(v) & (v > 0)
+        if valid.sum() < window * 0.5:
+            continue
+
+        c_valid = c[valid]
+        v_valid = v[valid]
+
+        lo, hi = c_valid.min(), c_valid.max()
+        if hi == lo:
+            vp_poc[i] = lo
+            vp_vah[i] = hi
+            vp_val[i] = lo
+            continue
+
+        # Build volume profile: distribute volume into price bins
+        bin_edges = np.linspace(lo, hi, n_bins + 1)
+        bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+        bin_vol = np.zeros(n_bins)
+
+        indices = np.clip(
+            ((c_valid - lo) / (hi - lo) * (n_bins - 1)).astype(int),
+            0, n_bins - 1
+        )
+        for idx, vol in zip(indices, v_valid):
+            bin_vol[idx] += vol
+
+        total_vol = bin_vol.sum()
+        if total_vol == 0:
+            continue
+
+        # POC = bin with max volume
+        poc_idx = np.argmax(bin_vol)
+        vp_poc[i] = bin_centers[poc_idx]
+
+        # Value Area: expand from POC until covering value_area_pct
+        va_vol = bin_vol[poc_idx]
+        lo_idx = poc_idx
+        hi_idx = poc_idx
+        target = total_vol * value_area_pct
+
+        while va_vol < target:
+            look_lo = bin_vol[lo_idx - 1] if lo_idx > 0 else 0
+            look_hi = bin_vol[hi_idx + 1] if hi_idx < n_bins - 1 else 0
+
+            if look_lo == 0 and look_hi == 0:
+                break
+
+            if look_lo >= look_hi:
+                lo_idx -= 1
+                va_vol += bin_vol[lo_idx]
+            else:
+                hi_idx += 1
+                va_vol += bin_vol[hi_idx]
+
+        vp_val[i] = bin_edges[lo_idx]       # lower edge of lowest VA bin
+        vp_vah[i] = bin_edges[hi_idx + 1]   # upper edge of highest VA bin
+
+    suffix = f"{window_days}d"
+    df[f"vp_poc_{suffix}"] = vp_poc
+    df[f"vp_vah_{suffix}"] = vp_vah
+    df[f"vp_val_{suffix}"] = vp_val
+
     return df
 
 

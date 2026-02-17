@@ -290,6 +290,63 @@ class RSIRisingCond:
         return f"RSIRisingCond(min_delta={self.min_delta}, lookback={self.lookback})"
 
 
+class VPBelowVALCond:
+    """
+    Buy/Sell when price is below Value Area Low (VP support break).
+
+    Args:
+        margin (float): Extra margin below VAL. Default=0.0.
+            close < VAL * (1 - margin) triggers signal.
+        window_days (int): VP lookback window in days. Default=7.
+
+    Required columns: vp_val_{window_days}d
+    """
+    def __init__(self, margin: float = 0.0, window_days: int = 7):
+        self.margin = margin
+        self.window_days = window_days
+        self.col = f"vp_val_{window_days}d"
+        m_str = f"-{margin*100:.0f}%" if margin > 0 else ""
+        self.name = f"VP<VAL{m_str}({window_days}d)"
+
+    def __call__(self, row: pd.Series) -> ConditionResult:
+        val = row.get(self.col, np.nan)
+        close = row.get("close", np.nan)
+        if pd.isna(val) or pd.isna(close):
+            return False
+        return self.name if close < val * (1 - self.margin) else False
+
+    def __repr__(self):
+        return f"VPBelowVALCond(margin={self.margin}, window_days={self.window_days})"
+
+
+class VPAboveVAHCond:
+    """
+    Buy/Sell when price is above Value Area High (VP resistance break).
+
+    Args:
+        margin (float): Extra margin above VAH. Default=0.0.
+        window_days (int): VP lookback window in days. Default=7.
+
+    Required columns: vp_vah_{window_days}d
+    """
+    def __init__(self, margin: float = 0.0, window_days: int = 7):
+        self.margin = margin
+        self.window_days = window_days
+        self.col = f"vp_vah_{window_days}d"
+        m_str = f"+{margin*100:.0f}%" if margin > 0 else ""
+        self.name = f"VP>VAH{m_str}({window_days}d)"
+
+    def __call__(self, row: pd.Series) -> ConditionResult:
+        vah = row.get(self.col, np.nan)
+        close = row.get("close", np.nan)
+        if pd.isna(vah) or pd.isna(close):
+            return False
+        return self.name if close > vah * (1 + self.margin) else False
+
+    def __repr__(self):
+        return f"VPAboveVAHCond(margin={self.margin}, window_days={self.window_days})"
+
+
 # ============================================================================
 # SELL CONDITIONS
 # ============================================================================
