@@ -290,6 +290,64 @@ class RSIRisingCond:
         return f"RSIRisingCond(min_delta={self.min_delta}, lookback={self.lookback})"
 
 
+class VPAbovePOCCond:
+    """
+    Signal when price is above VP Point of Control.
+
+    Args:
+        margin (float): Extra margin above POC. Default=0.0.
+            close > POC * (1 + margin) triggers signal.
+        window_days (int): VP lookback window in days. Default=7.
+
+    Required columns: vp_poc_{window_days}d
+    """
+    def __init__(self, margin: float = 0.0, window_days: int = 7):
+        self.margin = margin
+        self.window_days = window_days
+        self.col = f"vp_poc_{window_days}d"
+        m_str = f"+{margin*100:.0f}%" if margin > 0 else ""
+        self.name = f"VP>POC{m_str}({window_days}d)"
+
+    def __call__(self, row: pd.Series) -> ConditionResult:
+        poc = row.get(self.col, np.nan)
+        close = row.get("close", np.nan)
+        if pd.isna(poc) or pd.isna(close):
+            return False
+        return self.name if close > poc * (1 + self.margin) else False
+
+    def __repr__(self):
+        return f"VPAbovePOCCond(margin={self.margin}, window_days={self.window_days})"
+
+
+class VPBelowPOCCond:
+    """
+    Signal when price is below VP Point of Control.
+
+    Args:
+        margin (float): Extra margin below POC. Default=0.0.
+            close < POC * (1 - margin) triggers signal.
+        window_days (int): VP lookback window in days. Default=7.
+
+    Required columns: vp_poc_{window_days}d
+    """
+    def __init__(self, margin: float = 0.0, window_days: int = 7):
+        self.margin = margin
+        self.window_days = window_days
+        self.col = f"vp_poc_{window_days}d"
+        m_str = f"-{margin*100:.0f}%" if margin > 0 else ""
+        self.name = f"VP<POC{m_str}({window_days}d)"
+
+    def __call__(self, row: pd.Series) -> ConditionResult:
+        poc = row.get(self.col, np.nan)
+        close = row.get("close", np.nan)
+        if pd.isna(poc) or pd.isna(close):
+            return False
+        return self.name if close < poc * (1 - self.margin) else False
+
+    def __repr__(self):
+        return f"VPBelowPOCCond(margin={self.margin}, window_days={self.window_days})"
+
+
 class VPBelowVALCond:
     """
     Buy/Sell when price is below Value Area Low (VP support break).

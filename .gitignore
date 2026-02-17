@@ -8,3 +8,9 @@ build/
 .vscode/
 .idea/
 *.png
+data/btc_daily.csv
+data/fear_greed.csv
+data/cb_premium.csv
+data/binance/btc_hourly.csv
+data/binance/btc_15m.csv
+.claude/

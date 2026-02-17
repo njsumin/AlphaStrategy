@@ -42,6 +42,12 @@ from dateutil.relativedelta import relativedelta
 _PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 _DATA_DIR = os.path.join(_PROJECT_DIR, "data", "binance")
 BINANCE_CSV_PATH = os.path.join(_DATA_DIR, "binance_derivatives_daily.csv")
+_BTC_DAILY_CSV_PATH = os.path.join(_PROJECT_DIR, "data", "btc_daily.csv")
+_FEAR_GREED_CSV_PATH = os.path.join(_PROJECT_DIR, "data", "fear_greed.csv")
+_CB_PREMIUM_CSV_PATH = os.path.join(_PROJECT_DIR, "data", "cb_premium.csv")
+
+# Cache staleness threshold: re-download if local file is older than this
+_CACHE_MAX_AGE_HOURS = 6
 
 _SYMBOL = "BTCUSDT"
 _BINANCE_START = datetime(2020, 1, 1)
@@ -54,20 +60,61 @@ _RATE_LIMIT_SLEEP = 0.3
 # 1. BTC PRICE (yfinance)
 # ============================================================================
 
+def _is_cache_fresh(path: str, max_age_hours: int = _CACHE_MAX_AGE_HOURS) -> bool:
+    """Check if a cached CSV file exists and is younger than max_age_hours."""
+    if not os.path.exists(path):
+        return False
+    mtime = datetime.fromtimestamp(os.path.getmtime(path))
+    return (datetime.now() - mtime).total_seconds() < max_age_hours * 3600
+
+
 def load_btc_price(start: str = "2018-01-01") -> pd.DataFrame:
     """
-    Download BTC-USD daily OHLCV from yfinance.
+    Load BTC-USD daily OHLCV with local CSV cache.
+
+    Cache: data/btc_daily.csv (incremental update if stale).
 
     Returns:
         DataFrame with columns: date, open, close, volume
     """
-    btc = yf.download("BTC-USD", start=start, progress=False)
+    start_dt = pd.Timestamp(start)
+    cache = _BTC_DAILY_CSV_PATH
+
+    if _is_cache_fresh(cache):
+        df = pd.read_csv(cache)
+        df["date"] = pd.to_datetime(df["date"])
+        return df[df["date"] >= start_dt].reset_index(drop=True)
+
+    # Load existing cache for incremental update
+    existing = pd.DataFrame()
+    if os.path.exists(cache):
+        existing = pd.read_csv(cache)
+        existing["date"] = pd.to_datetime(existing["date"])
+
+    # Download from yfinance (from last cached date or start)
+    fetch_start = start
+    if not existing.empty:
+        fetch_start = (existing["date"].max() - pd.Timedelta(days=2)).strftime("%Y-%m-%d")
+
+    print("Downloading BTC daily price from yfinance...")
+    btc = yf.download("BTC-USD", start=fetch_start, progress=False)
     btc = btc.reset_index()
     if isinstance(btc.columns, pd.MultiIndex):
         btc.columns = [c[0] for c in btc.columns]
     btc = btc.rename(columns={"Date": "date", "Open": "open", "Close": "close", "Volume": "volume"})
     btc["date"] = pd.to_datetime(btc["date"]).dt.tz_localize(None).dt.normalize()
-    return btc[["date", "open", "close", "volume"]].copy()
+    btc = btc[["date", "open", "close", "volume"]].copy()
+
+    if not existing.empty and not btc.empty:
+        cutoff = btc["date"].min()
+        keep = existing[existing["date"] < cutoff]
+        btc = pd.concat([keep, btc], ignore_index=True).sort_values("date").reset_index(drop=True)
+
+    if not btc.empty:
+        os.makedirs(os.path.dirname(cache), exist_ok=True)
+        btc.to_csv(cache, index=False)
+
+    return btc[btc["date"] >= start_dt].reset_index(drop=True)
 
 
 # ============================================================================
@@ -76,21 +123,41 @@ def load_btc_price(start: str = "2018-01-01") -> pd.DataFrame:
 
 def load_fear_greed() -> pd.DataFrame:
     """
-    Download Fear & Greed Index from alternative.me API.
+    Load Fear & Greed Index with local CSV cache.
+
+    Cache: data/fear_greed.csv (re-download if stale).
 
     Returns:
         DataFrame with columns: date, fear_greed
         Empty DataFrame on failure.
     """
+    cache = _FEAR_GREED_CSV_PATH
+
+    if _is_cache_fresh(cache):
+        df = pd.read_csv(cache)
+        df["date"] = pd.to_datetime(df["date"])
+        return df
+
     try:
+        print("Downloading Fear & Greed Index...")
         resp = requests.get("https://api.alternative.me/fng/?limit=0&format=json", timeout=15)
         fg_data = resp.json()["data"]
         fg_df = pd.DataFrame(fg_data)
         fg_df["date"] = pd.to_datetime(fg_df["timestamp"].astype(int), unit="s").dt.normalize()
         fg_df["fear_greed"] = fg_df["value"].astype(int)
-        return fg_df[["date", "fear_greed"]]
+        fg_df = fg_df[["date", "fear_greed"]].sort_values("date").reset_index(drop=True)
+
+        os.makedirs(os.path.dirname(cache), exist_ok=True)
+        fg_df.to_csv(cache, index=False)
+        return fg_df
     except Exception as e:
-        print(f"Warning: F&G failed: {e}")
+        print(f"Warning: F&G download failed: {e}")
+        # Fallback to stale cache if available
+        if os.path.exists(cache):
+            print("  Using stale cache as fallback.")
+            df = pd.read_csv(cache)
+            df["date"] = pd.to_datetime(df["date"])
+            return df
         return pd.DataFrame(columns=["date", "fear_greed"])
 
 
@@ -310,13 +377,23 @@ def update_derivatives(full: bool = False):
 
 def load_coinbase_premium() -> pd.DataFrame:
     """
-    Download Coinbase Premium proxy (BTC-USD spot vs CME BTC=F futures).
+    Load Coinbase Premium proxy with local CSV cache.
+
+    Cache: data/cb_premium.csv (re-download if stale).
 
     Returns:
         DataFrame with columns: date, coinbase_premium
         Empty DataFrame on failure.
     """
+    cache = _CB_PREMIUM_CSV_PATH
+
+    if _is_cache_fresh(cache):
+        df = pd.read_csv(cache)
+        df["date"] = pd.to_datetime(df["date"])
+        return df
+
     try:
+        print("Downloading Coinbase Premium data...")
         spot = yf.download("BTC-USD", period="max", progress=False).reset_index()
         futures = yf.download("BTC=F", period="max", progress=False).reset_index()
         for d in [spot, futures]:
@@ -328,9 +405,19 @@ def load_coinbase_premium() -> pd.DataFrame:
         futures["date"] = pd.to_datetime(futures["date"]).dt.tz_localize(None).dt.normalize()
         m = pd.merge(spot[["date", "spot_close"]], futures[["date", "futures_close"]], on="date", how="inner")
         m["coinbase_premium"] = ((m["spot_close"] - m["futures_close"]) / m["futures_close"]) * 100
-        return m[["date", "coinbase_premium"]]
+        result = m[["date", "coinbase_premium"]].sort_values("date").reset_index(drop=True)
+
+        os.makedirs(os.path.dirname(cache), exist_ok=True)
+        result.to_csv(cache, index=False)
+        return result
     except Exception as e:
-        print(f"Warning: CB Premium failed: {e}")
+        print(f"Warning: CB Premium download failed: {e}")
+        # Fallback to stale cache if available
+        if os.path.exists(cache):
+            print("  Using stale cache as fallback.")
+            df = pd.read_csv(cache)
+            df["date"] = pd.to_datetime(df["date"])
+            return df
         return pd.DataFrame(columns=["date", "coinbase_premium"])
 
 
@@ -500,6 +587,55 @@ def _fetch_binance_klines(symbol: str, interval: str,
     df = pd.DataFrame(all_records)
     df = df.drop_duplicates(subset="date").sort_values("date").reset_index(drop=True)
     return df
+
+
+_15M_CSV_PATH = os.path.join(_DATA_DIR, "btc_15m.csv")
+
+
+def load_btc_price_15m(start: str = "2018-01-01") -> pd.DataFrame:
+    """
+    Load BTC-USDT 15-minute OHLCV from Binance API with local CSV cache.
+
+    Returns:
+        DataFrame with columns: date, open, close, volume (15-min bars)
+    """
+    start_dt = pd.Timestamp(start)
+    now = pd.Timestamp.now()
+    end_ms = int(now.timestamp() * 1000)
+
+    existing = pd.DataFrame()
+    if os.path.exists(_15M_CSV_PATH):
+        existing = pd.read_csv(_15M_CSV_PATH)
+        existing["date"] = pd.to_datetime(existing["date"])
+
+    if not existing.empty:
+        fetch_start_ms = int(existing["date"].max().timestamp() * 1000) + 1
+    else:
+        fetch_start_ms = int(start_dt.timestamp() * 1000)
+
+    # Fetch if at least 30 min gap
+    if fetch_start_ms < end_ms - 1_800_000:
+        print(f"Downloading BTC 15m data from Binance...")
+        new_data = _fetch_binance_klines("BTCUSDT", "15m", fetch_start_ms, end_ms)
+        if not new_data.empty:
+            if not existing.empty:
+                result = pd.concat([existing, new_data], ignore_index=True)
+                result = result.drop_duplicates(subset="date", keep="last")
+                result = result.sort_values("date").reset_index(drop=True)
+            else:
+                result = new_data
+            os.makedirs(_DATA_DIR, exist_ok=True)
+            result.to_csv(_15M_CSV_PATH, index=False)
+        else:
+            result = existing
+    else:
+        result = existing
+
+    if result.empty:
+        return pd.DataFrame(columns=["date", "open", "close", "volume"])
+
+    result = result[result["date"] >= start_dt].reset_index(drop=True)
+    return result
 
 
 _HOURLY_CSV_PATH = os.path.join(_DATA_DIR, "btc_hourly.csv")
