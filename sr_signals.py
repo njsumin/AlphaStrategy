@@ -23,7 +23,8 @@ ConditionResult = Union[str, bool]
 
 def add_momentum_indicators(df: pd.DataFrame,
                             velocity_bars: int = 4,
-                            atr_period: int = 14) -> pd.DataFrame:
+                            atr_period: int = 14,
+                            fast_velocity_bars: int = 2) -> pd.DataFrame:
     """
     Add momentum indicators for S/R strategy.
 
@@ -31,12 +32,16 @@ def add_momentum_indicators(df: pd.DataFrame,
         df: DataFrame with 'close', 'open' (and optionally 'high', 'low') columns.
         velocity_bars: Number of bars for velocity calculation.
         atr_period: ATR lookback period in bars.
+        fast_velocity_bars: Number of bars for fast velocity calculation.
 
     Adds columns:
         price_velocity: (close - close[N ago]) / close[N ago]
         atr: Average True Range over atr_period bars
         norm_velocity: price_velocity / (atr / close) — ATR-normalized speed
         velocity_delta: change in norm_velocity over velocity_bars
+        fast_price_velocity: fast N-bar return
+        fast_norm_velocity: ATR-normalized fast velocity
+        fast_velocity_delta: change in fast_norm_velocity over fast_velocity_bars
     """
     close = df["close"]
 
@@ -71,6 +76,17 @@ def add_momentum_indicators(df: pd.DataFrame,
     # Velocity delta: change in norm_velocity over lookback
     # Positive = accelerating / decelerating less, Negative = decelerating
     df["velocity_delta"] = df["norm_velocity"] - df["norm_velocity"].shift(velocity_bars)
+
+    # Fast velocity: short-period momentum (reuses same ATR)
+    df["fast_price_velocity"] = close.pct_change(periods=fast_velocity_bars)
+    df["fast_norm_velocity"] = np.where(
+        atr_pct > 0,
+        df["fast_price_velocity"] / atr_pct,
+        0.0
+    )
+    df["fast_velocity_delta"] = (
+        df["fast_norm_velocity"] - df["fast_norm_velocity"].shift(fast_velocity_bars)
+    )
 
     return df
 
@@ -178,7 +194,10 @@ class ReversalLongCond:
     def __init__(self, proximity_pct: float = 0.01, min_decel: float = 0.5,
                  velocity_ceil: float = 0.0, velocity_floor: float = None,
                  trend_sma: int = None, rsi_max: float = None,
-                 sr_count_min: int = None, max_abs_velocity: float = None):
+                 sr_count_min: int = None, max_abs_velocity: float = None,
+                 fast_velocity_ceil: float = None,
+                 fast_velocity_floor: float = None,
+                 fast_min_decel: float = None):
         self.proximity_pct = proximity_pct
         self.min_decel = min_decel
         self.velocity_ceil = velocity_ceil
@@ -193,6 +212,9 @@ class ReversalLongCond:
         self.rsi_max = rsi_max
         self.sr_count_min = sr_count_min
         self.max_abs_velocity = max_abs_velocity
+        self.fast_velocity_ceil = fast_velocity_ceil
+        self.fast_velocity_floor = fast_velocity_floor
+        self.fast_min_decel = fast_min_decel
         self.name = (f"RevL(px{proximity_pct*100:.1f}%,"
                      f"dc>{min_decel:.1f})")
 
@@ -222,6 +244,19 @@ class ReversalLongCond:
                 return False
         if self.velocity_floor is not None:
             if nv < self.velocity_floor:
+                return False
+        # Fast velocity filters
+        if self.fast_velocity_ceil is not None:
+            fnv = row.get("fast_norm_velocity", np.nan)
+            if pd.isna(fnv) or fnv > self.fast_velocity_ceil:
+                return False
+        if self.fast_velocity_floor is not None:
+            fnv = row.get("fast_norm_velocity", np.nan)
+            if pd.isna(fnv) or fnv < self.fast_velocity_floor:
+                return False
+        if self.fast_min_decel is not None:
+            fvd = row.get("fast_velocity_delta", np.nan)
+            if pd.isna(fvd) or fvd < self.fast_min_decel:
                 return False
         return self.name
 
@@ -263,7 +298,10 @@ class ReversalShortCond:
     def __init__(self, proximity_pct: float = 0.01, min_decel: float = 0.5,
                  velocity_floor: float = 0.0, velocity_ceil: float = None,
                  trend_sma: int = None, rsi_min: float = None,
-                 sr_count_min: int = None, max_abs_velocity: float = None):
+                 sr_count_min: int = None, max_abs_velocity: float = None,
+                 fast_velocity_floor: float = None,
+                 fast_velocity_ceil: float = None,
+                 fast_min_decel: float = None):
         self.proximity_pct = proximity_pct
         self.min_decel = min_decel
         self.velocity_floor = velocity_floor
@@ -278,6 +316,9 @@ class ReversalShortCond:
         self.rsi_min = rsi_min
         self.sr_count_min = sr_count_min
         self.max_abs_velocity = max_abs_velocity
+        self.fast_velocity_floor = fast_velocity_floor
+        self.fast_velocity_ceil = fast_velocity_ceil
+        self.fast_min_decel = fast_min_decel
         self.name = (f"RevS(px{proximity_pct*100:.1f}%,"
                      f"dc>{min_decel:.1f})")
 
@@ -307,6 +348,19 @@ class ReversalShortCond:
                 return False
         if self.velocity_ceil is not None:
             if nv > self.velocity_ceil:
+                return False
+        # Fast velocity filters
+        if self.fast_velocity_floor is not None:
+            fnv = row.get("fast_norm_velocity", np.nan)
+            if pd.isna(fnv) or fnv < self.fast_velocity_floor:
+                return False
+        if self.fast_velocity_ceil is not None:
+            fnv = row.get("fast_norm_velocity", np.nan)
+            if pd.isna(fnv) or fnv > self.fast_velocity_ceil:
+                return False
+        if self.fast_min_decel is not None:
+            fvd = row.get("fast_velocity_delta", np.nan)
+            if pd.isna(fvd) or fvd > -self.fast_min_decel:
                 return False
         return self.name
 

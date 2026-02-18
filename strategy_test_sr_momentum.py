@@ -28,6 +28,7 @@ Usage:
     python strategy_test_sr_momentum.py --sl --grid    # 1h stop-loss + parameter grid
     python strategy_test_sr_momentum.py --filter       # 1h entry filter grid (trend/RSI/sr_count/velocity)
     python strategy_test_sr_momentum.py --velocity     # 1h velocity range fine-grained grid
+    python strategy_test_sr_momentum.py --fast          # 1h fast velocity filter grid
     python strategy_test_sr_momentum.py --15m          # 15m baseline (1 year)
     python strategy_test_sr_momentum.py --15m --grid   # 15m baseline + grid (1 year)
 """
@@ -76,6 +77,7 @@ _KEEP_COLS = [
     "nearest_resistance", "nearest_support",
     "dist_to_resistance", "dist_to_support",
     "norm_velocity", "price_velocity", "velocity_delta",
+    "fast_norm_velocity", "fast_price_velocity", "fast_velocity_delta",
     "sr_count", "atr",
     "rsi_14", "sma_200",
 ]
@@ -625,6 +627,97 @@ def run_velocity_grid(df):
     return all_results, bh_ret, bh_1y
 
 
+def run_fast_grid(df):
+    """Grid search for fast norm_velocity filters on top of baseline."""
+    b = BASELINE
+    df_slim = _prepare_data(df, b["cluster_gap_pct"], b["velocity_bars"])
+    bh_ret, bh_1y = _compute_bh(df_slim)
+
+    prox = b["proximity_pct"]
+    decel = b["min_decel"]
+    v_ceil = b["velocity_ceil_long"]
+    v_floor = b["velocity_floor_short"]
+    sl = BASELINE_SL
+
+    # Grid dimensions for fast velocity filters
+    fast_ceil_long_list = [None, -0.5, 0, 0.5, 1.0]
+    fast_floor_long_list = [None, -2.0, -1.0, -0.5]
+    fast_decel_list = [None, 0.3, 0.5, 1.0]
+
+    configs = []
+    for fc in fast_ceil_long_list:
+        for ff in fast_floor_long_list:
+            for fd in fast_decel_list:
+                # Skip all-None (already covered by baseline)
+                if fc is None and ff is None and fd is None:
+                    continue
+                parts = []
+                if fc is not None:
+                    parts.append(f"fc{fc:+.1f}")
+                if ff is not None:
+                    parts.append(f"ff{ff:+.1f}")
+                if fd is not None:
+                    parts.append(f"fd{fd:.1f}")
+                tag = "_".join(parts)
+
+                long_kw = {"velocity_ceil": v_ceil}
+                short_kw = {"velocity_floor": v_floor}
+
+                if fc is not None:
+                    long_kw["fast_velocity_ceil"] = fc
+                    short_kw["fast_velocity_floor"] = -fc  # symmetric
+                if ff is not None:
+                    long_kw["fast_velocity_floor"] = ff
+                    short_kw["fast_velocity_ceil"] = -ff  # symmetric
+                if fd is not None:
+                    long_kw["fast_min_decel"] = fd
+                    short_kw["fast_min_decel"] = fd
+
+                configs.append({"name": tag, "long": long_kw, "short": short_kw})
+
+    all_results = []
+    total = len(configs) * 3
+    count = 0
+
+    for cfg in configs:
+        tag = cfg["name"]
+        long_kw = cfg["long"]
+        short_kw = cfg["short"]
+
+        all_results.append(backtest(
+            df_slim, f"L_{tag}",
+            buy_cond=ReversalLongCond(prox, decel, **long_kw),
+            sell_cond=NearResistanceCond(0.002),
+            close_conditions=sl,
+        ))
+        count += 1
+
+        all_results.append(backtest(
+            df_slim, f"S_{tag}",
+            buy_cond=lambda row: False,
+            sell_cond=lambda row: False,
+            short_cond=ReversalShortCond(prox, decel, **short_kw),
+            cover_cond=NearSupportCond(0.002),
+            close_conditions=sl,
+        ))
+        count += 1
+
+        all_results.append(backtest(
+            df_slim, f"D_{tag}",
+            buy_cond=ReversalLongCond(prox, decel, **long_kw),
+            sell_cond=NearResistanceCond(0.002),
+            short_cond=ReversalShortCond(prox, decel, **short_kw),
+            cover_cond=NearSupportCond(0.002),
+            close_conditions=sl,
+        ))
+        count += 1
+
+        if count % 9 == 0 or count == total:
+            print(f"  Progress: {count}/{total} combos done")
+
+    return all_results, bh_ret, bh_1y
+
+
 def run_stoploss_grid(df):
     """Run stop-loss mechanism grid search with fixed baseline entry parameters."""
     b = BASELINE
@@ -729,6 +822,7 @@ def main():
     sl_mode = "--sl" in sys.argv
     filter_mode = "--filter" in sys.argv
     velocity_mode = "--velocity" in sys.argv
+    fast_mode = "--fast" in sys.argv
 
     if mode_15m:
         # 15m mode: load 15m data with 30d warmup before 1-year backtest
@@ -799,6 +893,11 @@ def main():
             vel_results, bh_ret, bh_1y = run_velocity_grid(df)
             all_results.extend(vel_results)
 
+        if fast_mode:
+            print("\n===== FAST VELOCITY GRID SWEEP =====")
+            fast_results, bh_ret, bh_1y = run_fast_grid(df)
+            all_results.extend(fast_results)
+
         if sl_mode:
             print("\n===== STOP-LOSS GRID SWEEP =====")
             sl_results, bh_ret, bh_1y = run_stoploss_grid(df)
@@ -812,7 +911,7 @@ def main():
         active = [r for r in all_results if r["trades"] > 0]
         active.sort(key=lambda x: x["sharpe"], reverse=True)
 
-        if grid_mode or sl_mode or filter_mode or velocity_mode:
+        if grid_mode or sl_mode or filter_mode or velocity_mode or fast_mode:
             top = active[:30]
             print_results(top, buy_and_hold_ret=bh_ret, buy_and_hold_1y=bh_1y)
 
