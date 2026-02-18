@@ -287,6 +287,18 @@ def main():
             "sell_cond": RSIBuyCond(threshold=30),
             "close_conditions": [StopLossCond(-0.10)],
         },
+
+        # ------ FG + RevRSI + SMA 三重过滤 ------
+        # FG<50（排除贪婪）AND RSI>70 AND close>SMA200：最低回撤-27.2%，近1Y正收益
+        {
+            "name": "FG50&RevRSI&SMA200",
+            "buy_cond": combine_conditions(
+                FearGreedBuyCond(threshold=50),
+                RSISellCond(threshold=70),
+                TrendFilterCond(ma_period=200),
+                mode="AND"),
+            "sell_cond": RSIBuyCond(threshold=30),
+        },
     ]
 
     strategies.append(preset_alpha_combo())

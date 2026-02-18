@@ -44,14 +44,17 @@ def load_data(start: str = "2018-01-01",
         include_fg: Include Fear & Greed Index.
         include_derivatives: Include Binance Funding Rate and OI.
         include_cb_premium: Include Coinbase Premium proxy.
-        interval: "1d" for daily, "1h" for hourly.
+        interval: "1d" for daily, "1h" for hourly, "15m" for 15-minute.
 
     Returns:
         DataFrame with columns: date, open, close, fear_greed, funding_rate,
         open_interest_usd, coinbase_premium, rsi_14, funding_sma7,
         cb_prem_sma7, oi_pct_7d, oi_valid, drawdown_30d, etc.
     """
-    if interval == "1h":
+    if interval == "15m":
+        df = load_btc_price_15m(start=start)
+        bars_per_day = 96
+    elif interval == "1h":
         df = load_all_data_hourly(
             start=start,
             include_fg=include_fg,
@@ -75,7 +78,7 @@ def load_data(start: str = "2018-01-01",
     # Store bars_per_day in DataFrame metadata so backtest can use it
     df.attrs["bars_per_day"] = bars_per_day
 
-    unit = "bars" if interval == "1h" else "days"
+    unit = "bars" if interval in ("1h", "15m") else "days"
     print(f"Dataset: {len(df)} {unit} ({df['date'].min()} ~ {df['date'].max()})")
     return df
 
@@ -131,7 +134,11 @@ def _add_indicators(df: pd.DataFrame, bars_per_day: int = 1) -> pd.DataFrame:
 
     # Volume Profile (rolling window, multiple lookbacks)
     if "volume" in df.columns and df["volume"].notna().any():
-        if bpd == 24:
+        if bpd == 96:
+            # 15m data: compute VP directly with extended windows
+            for vp_days in [1, 3, 7, 14, 30]:
+                df = _add_volume_profile(df, bars_per_day=bpd, window_days=vp_days)
+        elif bpd == 24:
             # Use 15-min data for higher-resolution VP, resample back to hourly
             df = _compute_vp_from_15m(df)
         else:
@@ -197,8 +204,7 @@ def _add_volume_profile(df: pd.DataFrame, bars_per_day: int = 24,
             ((c_valid - lo) / (hi - lo) * (n_bins - 1)).astype(int),
             0, n_bins - 1
         )
-        for idx, vol in zip(indices, v_valid):
-            bin_vol[idx] += vol
+        np.add.at(bin_vol, indices, v_valid)
 
         total_vol = bin_vol.sum()
         if total_vol == 0:
@@ -253,7 +259,7 @@ def _compute_vp_from_15m(df_hourly: pd.DataFrame) -> pd.DataFrame:
 
     if df_15m.empty or "volume" not in df_15m.columns:
         # Fallback: compute VP from hourly data
-        for vp_days in [3, 7, 14]:
+        for vp_days in [3, 7, 14, 30]:
             df_hourly = _add_volume_profile(
                 df_hourly, bars_per_day=24, window_days=vp_days)
         return df_hourly
@@ -261,7 +267,7 @@ def _compute_vp_from_15m(df_hourly: pd.DataFrame) -> pd.DataFrame:
     print(f"Computing VP from 15m data ({len(df_15m)} bars)...")
 
     # Compute VP on 15-min data
-    for vp_days in [3, 7, 14]:
+    for vp_days in [3, 7, 14, 30]:
         df_15m = _add_volume_profile(
             df_15m, bars_per_day=96, window_days=vp_days)
 
@@ -464,10 +470,39 @@ def backtest(df: pd.DataFrame,
             if should_sell:
                 pending_sell = sell_source
 
-        elif position == -1 and cover_cond is not None:
-            s = cover_cond(row)
-            if s:
-                pending_cover = s if isinstance(s, str) else "COVER"
+        elif position == -1:
+            should_cover = False
+            cover_source = ""
+
+            if cover_cond is not None:
+                s = cover_cond(row)
+                if s:
+                    should_cover = True
+                    cover_source = s if isinstance(s, str) else "COVER"
+
+            # Check close conditions for short positions (stop-loss etc.)
+            if not should_cover and close_conditions:
+                # For short: loss when price rises above entry
+                short_pnl_price = entry_price * (2 - close / entry_price)
+                days_held = (date - entry_date).total_seconds() / 86400 if entry_date else 0
+                for cc in close_conditions:
+                    if hasattr(cc, 'check'):
+                        import inspect
+                        sig = inspect.signature(cc.check)
+                        params = list(sig.parameters.keys())
+                        if 'days_held' in params:
+                            r = cc.check(short_pnl_price, entry_price, days_held)
+                        elif 'peak_price' in params:
+                            r = False  # trailing stop not applicable for shorts
+                        else:
+                            r = cc.check(short_pnl_price, entry_price)
+                        if r:
+                            should_cover = True
+                            cover_source = r if isinstance(r, str) else cc.name
+                            break
+
+            if should_cover:
+                pending_cover = cover_source
 
         # Track portfolio value (mark-to-market at close)
         if position == 0:
