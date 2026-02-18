@@ -631,6 +631,130 @@ class TrailingStopCond:
         return f"TrailingStopCond(threshold={self.threshold})"
 
 
+class SRStopLossLong:
+    """
+    S/R dynamic stop-loss for LONG positions.
+    Stop = nearest_support * (1 - buffer), clamped to [entry*(1-max_loss), entry*(1-min_loss)].
+
+    Args:
+        buffer_pct (float): Buffer below support level. Default=0.003 (0.3%).
+        max_loss (float): Maximum allowed loss from entry. Default=0.03 (3%).
+        min_loss (float): Minimum loss threshold (don't stop too tight). Default=0.01 (1%).
+
+    Required columns in row: nearest_support, close
+    """
+    def __init__(self, buffer_pct: float = 0.003, max_loss: float = 0.03,
+                 min_loss: float = 0.01):
+        self.buffer_pct = buffer_pct
+        self.max_loss = max_loss
+        self.min_loss = min_loss
+        self.name = f"SR_SL_L(b{buffer_pct*1000:.0f}_x{max_loss*100:.0f})"
+
+    def check(self, current_price: float, entry_price: float, row) -> ConditionResult:
+        support = row.get("nearest_support", np.nan)
+        close = row.get("close", current_price)
+        if pd.isna(support):
+            return False
+        stop = support * (1 - self.buffer_pct)
+        # Clamp: at most max_loss, at least min_loss space
+        stop = max(stop, entry_price * (1 - self.max_loss))
+        stop = min(stop, entry_price * (1 - self.min_loss))
+        return self.name if close < stop else False
+
+    def __repr__(self):
+        return (f"SRStopLossLong(buffer_pct={self.buffer_pct}, "
+                f"max_loss={self.max_loss}, min_loss={self.min_loss})")
+
+
+class SRStopLossShort:
+    """
+    S/R dynamic stop-loss for SHORT positions.
+    Stop = nearest_resistance * (1 + buffer), clamped to [entry*(1+min_loss), entry*(1+max_loss)].
+
+    Args:
+        buffer_pct (float): Buffer above resistance level. Default=0.003 (0.3%).
+        max_loss (float): Maximum allowed loss from entry. Default=0.03 (3%).
+        min_loss (float): Minimum loss threshold. Default=0.01 (1%).
+
+    Required columns in row: nearest_resistance, close
+    """
+    def __init__(self, buffer_pct: float = 0.003, max_loss: float = 0.03,
+                 min_loss: float = 0.01):
+        self.buffer_pct = buffer_pct
+        self.max_loss = max_loss
+        self.min_loss = min_loss
+        self.name = f"SR_SL_S(b{buffer_pct*1000:.0f}_x{max_loss*100:.0f})"
+
+    def check(self, current_price: float, entry_price: float, row) -> ConditionResult:
+        resistance = row.get("nearest_resistance", np.nan)
+        close = row.get("close", current_price)
+        if pd.isna(resistance):
+            return False
+        stop = resistance * (1 + self.buffer_pct)
+        # Clamp: at most max_loss, at least min_loss space
+        stop = min(stop, entry_price * (1 + self.max_loss))
+        stop = max(stop, entry_price * (1 + self.min_loss))
+        return self.name if close > stop else False
+
+    def __repr__(self):
+        return (f"SRStopLossShort(buffer_pct={self.buffer_pct}, "
+                f"max_loss={self.max_loss}, min_loss={self.min_loss})")
+
+
+class ATRStopLossCond:
+    """
+    ATR-based volatility stop-loss. Stop distance = multiplier * ATR.
+    Works for both long and short via engine's PnL price transformation.
+
+    Args:
+        multiplier (float): ATR multiplier for stop distance. Default=2.0.
+
+    Required columns in row: atr
+    For long: triggers when current_price < entry - multiplier * atr
+    For short: engine passes short_pnl_price, equivalent math applies.
+    """
+    def __init__(self, multiplier: float = 2.0):
+        self.multiplier = multiplier
+        self.name = f"ATR{multiplier:.1f}x"
+
+    def check(self, current_price: float, entry_price: float, row) -> ConditionResult:
+        atr = row.get("atr", 0)
+        if pd.isna(atr) or atr <= 0:
+            return False
+        stop = entry_price - self.multiplier * atr
+        return self.name if current_price < stop else False
+
+    def __repr__(self):
+        return f"ATRStopLossCond(multiplier={self.multiplier})"
+
+
+class TimeBarStopCond:
+    """
+    Time-based stop: exit if held > max_bars and position is not profitable.
+
+    Args:
+        max_bars (int): Maximum bars to hold before checking. Default=48.
+        bars_per_day (int): Bars per calendar day (24 for 1h). Default=24.
+
+    Uses days_held dispatch (no row needed).
+    """
+    def __init__(self, max_bars: int = 48, bars_per_day: int = 24):
+        self.max_bars = max_bars
+        self.bars_per_day = bars_per_day
+        self.name = f"Time{max_bars}b"
+
+    def check(self, current_price: float, entry_price: float,
+              days_held: float) -> ConditionResult:
+        bars_held = days_held * self.bars_per_day
+        if bars_held < self.max_bars:
+            return False
+        pnl = (current_price - entry_price) / entry_price
+        return self.name if pnl <= 0 else False
+
+    def __repr__(self):
+        return f"TimeBarStopCond(max_bars={self.max_bars})"
+
+
 # ============================================================================
 # COMBINATORS
 # ============================================================================

@@ -456,7 +456,9 @@ def backtest(df: pd.DataFrame,
                         import inspect
                         sig = inspect.signature(cc.check)
                         params = list(sig.parameters.keys())
-                        if 'days_held' in params:
+                        if 'row' in params:
+                            r = cc.check(close, entry_price, row)
+                        elif 'days_held' in params:
                             r = cc.check(close, entry_price, days_held)
                         elif 'peak_price' in params:
                             r = cc.check(close, peak_price)
@@ -490,7 +492,9 @@ def backtest(df: pd.DataFrame,
                         import inspect
                         sig = inspect.signature(cc.check)
                         params = list(sig.parameters.keys())
-                        if 'days_held' in params:
+                        if 'row' in params:
+                            r = cc.check(short_pnl_price, entry_price, row)
+                        elif 'days_held' in params:
                             r = cc.check(short_pnl_price, entry_price, days_held)
                         elif 'peak_price' in params:
                             r = False  # trailing stop not applicable for shorts
