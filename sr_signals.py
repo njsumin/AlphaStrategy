@@ -176,6 +176,8 @@ class ReversalLongCond:
         6. sr_count_min: require sr_count >= sr_count_min (S/R density)
         7. max_abs_velocity: require norm_velocity > -max_abs_velocity
            (filter false reversals where price still falling fast)
+        8. min_reward_pct: require dist_to_resistance >= min_reward_pct
+           (filter entries with insufficient upside profit space)
 
     Args:
         proximity_pct: Max distance to support (fraction). Default=0.01.
@@ -190,6 +192,7 @@ class ReversalLongCond:
         rsi_max: Max RSI-14 for oversold confirmation. None=disabled.
         sr_count_min: Min S/R cluster count. None=disabled.
         max_abs_velocity: Deprecated, use velocity_floor=-X instead. None=disabled.
+        min_reward_pct: Min distance to resistance (fraction). None=disabled.
     """
     def __init__(self, proximity_pct: float = 0.01, min_decel: float = 0.5,
                  velocity_ceil: float = 0.0, velocity_floor: float = None,
@@ -197,7 +200,8 @@ class ReversalLongCond:
                  sr_count_min: int = None, max_abs_velocity: float = None,
                  fast_velocity_ceil: float = None,
                  fast_velocity_floor: float = None,
-                 fast_min_decel: float = None):
+                 fast_min_decel: float = None,
+                 min_reward_pct: float = None):
         self.proximity_pct = proximity_pct
         self.min_decel = min_decel
         self.velocity_ceil = velocity_ceil
@@ -215,6 +219,7 @@ class ReversalLongCond:
         self.fast_velocity_ceil = fast_velocity_ceil
         self.fast_velocity_floor = fast_velocity_floor
         self.fast_min_decel = fast_min_decel
+        self.min_reward_pct = min_reward_pct
         self.name = (f"RevL(px{proximity_pct*100:.1f}%,"
                      f"dc>{min_decel:.1f})")
 
@@ -258,6 +263,12 @@ class ReversalLongCond:
             fvd = row.get("fast_velocity_delta", np.nan)
             if pd.isna(fvd) or fvd < self.fast_min_decel:
                 return False
+        # Reward filter: ensure enough upside to nearest resistance
+        if self.min_reward_pct is not None:
+            dist_res = row.get("dist_to_resistance", np.nan)
+            # NaN = no resistance found → allow (conservative)
+            if not pd.isna(dist_res) and dist_res < self.min_reward_pct:
+                return False
         return self.name
 
     def __repr__(self):
@@ -280,6 +291,8 @@ class ReversalShortCond:
         6. sr_count_min: require sr_count >= sr_count_min (S/R density)
         7. max_abs_velocity: require norm_velocity < max_abs_velocity
            (filter false reversals where price still rising fast)
+        8. min_reward_pct: require dist_to_support >= min_reward_pct
+           (filter entries with insufficient downside profit space)
 
     Args:
         proximity_pct: Max distance to resistance (fraction). Default=0.01.
@@ -294,6 +307,7 @@ class ReversalShortCond:
         rsi_min: Min RSI-14 for overbought confirmation. None=disabled.
         sr_count_min: Min S/R cluster count. None=disabled.
         max_abs_velocity: Deprecated, use velocity_ceil=X instead. None=disabled.
+        min_reward_pct: Min distance to support (fraction). None=disabled.
     """
     def __init__(self, proximity_pct: float = 0.01, min_decel: float = 0.5,
                  velocity_floor: float = 0.0, velocity_ceil: float = None,
@@ -301,7 +315,8 @@ class ReversalShortCond:
                  sr_count_min: int = None, max_abs_velocity: float = None,
                  fast_velocity_floor: float = None,
                  fast_velocity_ceil: float = None,
-                 fast_min_decel: float = None):
+                 fast_min_decel: float = None,
+                 min_reward_pct: float = None):
         self.proximity_pct = proximity_pct
         self.min_decel = min_decel
         self.velocity_floor = velocity_floor
@@ -319,6 +334,7 @@ class ReversalShortCond:
         self.fast_velocity_floor = fast_velocity_floor
         self.fast_velocity_ceil = fast_velocity_ceil
         self.fast_min_decel = fast_min_decel
+        self.min_reward_pct = min_reward_pct
         self.name = (f"RevS(px{proximity_pct*100:.1f}%,"
                      f"dc>{min_decel:.1f})")
 
@@ -361,6 +377,12 @@ class ReversalShortCond:
         if self.fast_min_decel is not None:
             fvd = row.get("fast_velocity_delta", np.nan)
             if pd.isna(fvd) or fvd > -self.fast_min_decel:
+                return False
+        # Reward filter: ensure enough downside to nearest support
+        if self.min_reward_pct is not None:
+            dist_sup = row.get("dist_to_support", np.nan)
+            # NaN = no support found → allow (conservative)
+            if not pd.isna(dist_sup) and dist_sup < self.min_reward_pct:
                 return False
         return self.name
 

@@ -29,6 +29,7 @@ Usage:
     python strategy_test_sr_momentum.py --filter       # 1h entry filter grid (trend/RSI/sr_count/velocity)
     python strategy_test_sr_momentum.py --velocity     # 1h velocity range fine-grained grid
     python strategy_test_sr_momentum.py --fast          # 1h fast velocity filter grid
+    python strategy_test_sr_momentum.py --vp            # 1h VP window combination grid
     python strategy_test_sr_momentum.py --15m          # 15m baseline (1 year)
     python strategy_test_sr_momentum.py --15m --grid   # 15m baseline + grid (1 year)
 """
@@ -91,9 +92,10 @@ def _slim_df(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def _prepare_data(df, cluster_gap_pct, velocity_bars, backtest_start="2021-01-01"):
+def _prepare_data(df, cluster_gap_pct, velocity_bars, backtest_start="2021-01-01",
+                   vp_windows=None):
     """Add S/R levels + momentum indicators, trim to backtest period."""
-    df_sr = add_sr_levels(df.copy(), vp_windows=VP_WINDOWS,
+    df_sr = add_sr_levels(df.copy(), vp_windows=vp_windows or VP_WINDOWS,
                           cluster_gap_pct=cluster_gap_pct)
     df_bt = df_sr[df_sr["date"] >= backtest_start].reset_index(drop=True)
     df_bt.attrs = df_sr.attrs.copy()
@@ -718,6 +720,119 @@ def run_fast_grid(df):
     return all_results, bh_ret, bh_1y
 
 
+def run_vp_grid(df):
+    """Grid search over VP window combinations with baseline + fast velocity params."""
+    b = BASELINE
+    bh_ret = bh_1y = 0
+
+    prox = b["proximity_pct"]
+    decel = b["min_decel"]
+    v_ceil = b["velocity_ceil_long"]
+    v_floor = b["velocity_floor_short"]
+    sl = BASELINE_SL
+
+    # VP window combinations to test
+    vp_combos = [
+        # Single windows
+        [5], [7], [10], [14], [21], [30], [45], [60], [90],
+        # Dual windows
+        [5, 14], [7, 14], [7, 21], [7, 30], [10, 30], [14, 30], [14, 45],
+        # Triple windows (baseline + variants)
+        [3, 7, 14], [5, 10, 21], [5, 14, 30], [7, 14, 30],
+        [7, 21, 45], [3, 7, 30], [10, 14, 30],
+        # Triple with long-period windows
+        [7, 14, 60], [7, 30, 90], [14, 30, 60], [7, 14, 90],
+        # Quad windows
+        [3, 7, 14, 30], [5, 7, 14, 30], [7, 10, 14, 30], [5, 10, 21, 45],
+        # Quad with long-period windows
+        [7, 14, 30, 60], [7, 14, 30, 90], [7, 14, 60, 90], [7, 30, 60, 90],
+        # Five windows
+        [7, 14, 30, 60, 90],
+    ]
+
+    # Param sets: baseline, fast, and reward-filtered variants
+    param_sets = [
+        {"name": "base",
+         "long": {"velocity_ceil": v_ceil},
+         "short": {"velocity_floor": v_floor}},
+        {"name": "fast",
+         "long": {"velocity_ceil": v_ceil,
+                  "fast_velocity_ceil": 0.5, "fast_velocity_floor": -1.0,
+                  "fast_min_decel": 0.5},
+         "short": {"velocity_floor": v_floor,
+                   "fast_velocity_floor": -0.5, "fast_velocity_ceil": 1.0,
+                   "fast_min_decel": 0.5}},
+        {"name": "base_rw1",
+         "long": {"velocity_ceil": v_ceil, "min_reward_pct": 0.01},
+         "short": {"velocity_floor": v_floor, "min_reward_pct": 0.01}},
+        {"name": "base_rw2",
+         "long": {"velocity_ceil": v_ceil, "min_reward_pct": 0.02},
+         "short": {"velocity_floor": v_floor, "min_reward_pct": 0.02}},
+        {"name": "fast_rw1",
+         "long": {"velocity_ceil": v_ceil,
+                  "fast_velocity_ceil": 0.5, "fast_velocity_floor": -1.0,
+                  "fast_min_decel": 0.5, "min_reward_pct": 0.01},
+         "short": {"velocity_floor": v_floor,
+                   "fast_velocity_floor": -0.5, "fast_velocity_ceil": 1.0,
+                   "fast_min_decel": 0.5, "min_reward_pct": 0.01}},
+        {"name": "fast_rw2",
+         "long": {"velocity_ceil": v_ceil,
+                  "fast_velocity_ceil": 0.5, "fast_velocity_floor": -1.0,
+                  "fast_min_decel": 0.5, "min_reward_pct": 0.02},
+         "short": {"velocity_floor": v_floor,
+                   "fast_velocity_floor": -0.5, "fast_velocity_ceil": 1.0,
+                   "fast_min_decel": 0.5, "min_reward_pct": 0.02}},
+    ]
+
+    all_results = []
+    total = len(vp_combos) * len(param_sets) * 3
+    count = 0
+
+    for vp_wins in vp_combos:
+        vp_tag = "vp" + "_".join(str(w) for w in vp_wins)
+        df_slim = _prepare_data(df, b["cluster_gap_pct"], b["velocity_bars"],
+                                vp_windows=vp_wins)
+        bh_ret, bh_1y = _compute_bh(df_slim)
+
+        for ps in param_sets:
+            tag = f"{vp_tag}_{ps['name']}"
+            long_kw = ps["long"]
+            short_kw = ps["short"]
+
+            all_results.append(backtest(
+                df_slim, f"L_{tag}",
+                buy_cond=ReversalLongCond(prox, decel, **long_kw),
+                sell_cond=NearResistanceCond(0.002),
+                close_conditions=sl,
+            ))
+            count += 1
+
+            all_results.append(backtest(
+                df_slim, f"S_{tag}",
+                buy_cond=lambda row: False,
+                sell_cond=lambda row: False,
+                short_cond=ReversalShortCond(prox, decel, **short_kw),
+                cover_cond=NearSupportCond(0.002),
+                close_conditions=sl,
+            ))
+            count += 1
+
+            all_results.append(backtest(
+                df_slim, f"D_{tag}",
+                buy_cond=ReversalLongCond(prox, decel, **long_kw),
+                sell_cond=NearResistanceCond(0.002),
+                short_cond=ReversalShortCond(prox, decel, **short_kw),
+                cover_cond=NearSupportCond(0.002),
+                close_conditions=sl,
+            ))
+            count += 1
+
+            if count % 9 == 0 or count == total:
+                print(f"  Progress: {count}/{total} combos done")
+
+    return all_results, bh_ret, bh_1y
+
+
 def run_stoploss_grid(df):
     """Run stop-loss mechanism grid search with fixed baseline entry parameters."""
     b = BASELINE
@@ -823,6 +938,7 @@ def main():
     filter_mode = "--filter" in sys.argv
     velocity_mode = "--velocity" in sys.argv
     fast_mode = "--fast" in sys.argv
+    vp_mode = "--vp" in sys.argv
 
     if mode_15m:
         # 15m mode: load 15m data with 30d warmup before 1-year backtest
@@ -898,6 +1014,11 @@ def main():
             fast_results, bh_ret, bh_1y = run_fast_grid(df)
             all_results.extend(fast_results)
 
+        if vp_mode:
+            print("\n===== VP WINDOW GRID SWEEP =====")
+            vp_results, bh_ret, bh_1y = run_vp_grid(df)
+            all_results.extend(vp_results)
+
         if sl_mode:
             print("\n===== STOP-LOSS GRID SWEEP =====")
             sl_results, bh_ret, bh_1y = run_stoploss_grid(df)
@@ -911,7 +1032,7 @@ def main():
         active = [r for r in all_results if r["trades"] > 0]
         active.sort(key=lambda x: x["sharpe"], reverse=True)
 
-        if grid_mode or sl_mode or filter_mode or velocity_mode or fast_mode:
+        if grid_mode or sl_mode or filter_mode or velocity_mode or fast_mode or vp_mode:
             top = active[:30]
             print_results(top, buy_and_hold_ret=bh_ret, buy_and_hold_1y=bh_1y)
 

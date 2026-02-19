@@ -259,7 +259,7 @@ def _compute_vp_from_15m(df_hourly: pd.DataFrame) -> pd.DataFrame:
 
     if df_15m.empty or "volume" not in df_15m.columns:
         # Fallback: compute VP from hourly data
-        for vp_days in [3, 7, 14, 30]:
+        for vp_days in [3, 5, 7, 10, 14, 21, 30, 45, 60, 90]:
             df_hourly = _add_volume_profile(
                 df_hourly, bars_per_day=24, window_days=vp_days)
         return df_hourly
@@ -267,7 +267,7 @@ def _compute_vp_from_15m(df_hourly: pd.DataFrame) -> pd.DataFrame:
     print(f"Computing VP from 15m data ({len(df_15m)} bars)...")
 
     # Compute VP on 15-min data
-    for vp_days in [3, 7, 14, 30]:
+    for vp_days in [3, 5, 7, 10, 14, 21, 30, 45, 60, 90]:
         df_15m = _add_volume_profile(
             df_15m, bars_per_day=96, window_days=vp_days)
 
