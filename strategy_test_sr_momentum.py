@@ -18,8 +18,9 @@ Grid parameters:
 Long + Short + Dual direction for each combination.
 
 15m mode (--15m):
-  Explores 15-minute granularity with bar counts scaled ×4 from 1h.
-  Backtests most recent 1 year only (>= 2025-02-18).
+  Full-history 15m baseline mirroring 1h baseline with bar counts scaled ×4.
+  velocity_bars=32 (8h), fast_velocity_bars=8 (2h), TimeBarStop=192b (48h).
+  Backtests full history from 2021-01-01 (same period as 1h baseline).
 
 Usage:
     python strategy_test_sr_momentum.py               # 1h baseline only
@@ -30,8 +31,14 @@ Usage:
     python strategy_test_sr_momentum.py --velocity     # 1h velocity range fine-grained grid
     python strategy_test_sr_momentum.py --fast          # 1h fast velocity filter grid
     python strategy_test_sr_momentum.py --vp            # 1h VP window combination grid
-    python strategy_test_sr_momentum.py --15m          # 15m baseline (1 year)
-    python strategy_test_sr_momentum.py --15m --grid   # 15m baseline + grid (1 year)
+    python strategy_test_sr_momentum.py --wbottom      # 1h W-bottom/M-top microstructure filter grid
+    python strategy_test_sr_momentum.py --sensitivity  # 1h one-at-a-time parameter sensitivity analysis
+    python strategy_test_sr_momentum.py --15m           # 15m baseline (full history)
+    python strategy_test_sr_momentum.py --15m --grid    # 15m baseline + grid
+    python strategy_test_sr_momentum.py --15m --optimize # 15m walk-forward optimization
+    python strategy_test_sr_momentum.py --volbaseline   # volume-clock S/R strategy
+                                                        #   baseline (2021-present)
+                                                        #   + walk-forward opt (train 2021-2025.6 / val 2025.6+)
 """
 
 import sys
@@ -45,7 +52,9 @@ from engine import load_data, backtest, print_results, save_results_to_files
 from sr_levels import add_sr_levels
 from sr_signals import (
     add_momentum_indicators,
+    add_volume_momentum_indicators,
     ReversalLongCond, ReversalShortCond,
+    VolumeReversalLongCond, VolumeReversalShortCond,
     NearResistanceCond, NearSupportCond,
 )
 
@@ -64,13 +73,19 @@ BASELINE = {
 BASELINE_SL = [StopLossCond(-0.02), TimeBarStopCond(48)]
 
 # 15m baseline: bar counts ×4 from 1h (8h window = 32×15m bars)
+# Parameters mirror the 1h baseline; time-based values scaled by ×4.
 BASELINE_15M = {
-    "velocity_bars": 32,
+    "velocity_bars": 32,          # 8h × 4 = 32 bars in 15m
+    "fast_velocity_bars": 8,      # 2h × 4 = 8 bars in 15m
     "proximity_pct": 0.005,
-    "min_decel": 1.0,
+    "min_decel": 1.5,             # same as 1h baseline
     "cluster_gap_pct": 0.01,
+    "velocity_ceil_long": 0.5,    # same as 1h baseline
+    "velocity_floor_short": -0.5, # same as 1h baseline
     "vp_windows": [7, 14, 30],
 }
+# 48 1h-bars = 2 calendar days → 192 15m-bars
+BASELINE_15M_SL = [StopLossCond(-0.02), TimeBarStopCond(192, bars_per_day=96)]
 
 # Columns needed by backtest + conditions (slim df to speed up iterrows)
 _KEEP_COLS = [
@@ -79,8 +94,13 @@ _KEEP_COLS = [
     "dist_to_resistance", "dist_to_support",
     "norm_velocity", "price_velocity", "velocity_delta",
     "fast_norm_velocity", "fast_price_velocity", "fast_velocity_delta",
+    # volume-clock indicators
+    "vol_norm_velocity", "vol_velocity", "vol_velocity_delta",
+    "fast_vol_norm_velocity", "fast_vol_velocity", "fast_vol_velocity_delta",
+    "vol_lookback_bars", "volume_ratio",
     "sr_count", "atr",
     "rsi_14", "sma_200",
+    "w_bottom_strength", "m_top_strength",
 ]
 
 
@@ -93,13 +113,36 @@ def _slim_df(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _prepare_data(df, cluster_gap_pct, velocity_bars, backtest_start="2021-01-01",
-                   vp_windows=None):
+                   vp_windows=None, fast_velocity_bars=2):
     """Add S/R levels + momentum indicators, trim to backtest period."""
     df_sr = add_sr_levels(df.copy(), vp_windows=vp_windows or VP_WINDOWS,
                           cluster_gap_pct=cluster_gap_pct)
     df_bt = df_sr[df_sr["date"] >= backtest_start].reset_index(drop=True)
     df_bt.attrs = df_sr.attrs.copy()
-    df_m = add_momentum_indicators(df_bt, velocity_bars=velocity_bars)
+    df_m = add_momentum_indicators(df_bt, velocity_bars=velocity_bars,
+                                   fast_velocity_bars=fast_velocity_bars)
+    return _slim_df(df_m)
+
+
+def _prepare_vol_data(df, cluster_gap_pct, velocity_vol_mult,
+                      fast_vol_mult=2.0, vol_ref_period=168,
+                      backtest_start="2021-01-01", vp_windows=None):
+    """Add S/R levels + volume-clock momentum indicators, trim to period.
+
+    Note: S/R level computation and volume indicators use ALL data before
+    backtest_start for warm-up (VP windows, rolling volume reference).
+    Only the trimmed slice is returned for backtesting.
+    """
+    df_sr = add_sr_levels(df.copy(), vp_windows=vp_windows or VP_WINDOWS,
+                          cluster_gap_pct=cluster_gap_pct)
+    df_bt = df_sr[df_sr["date"] >= backtest_start].reset_index(drop=True)
+    df_bt.attrs = df_sr.attrs.copy()
+    df_m = add_volume_momentum_indicators(
+        df_bt,
+        velocity_vol_mult=velocity_vol_mult,
+        fast_vol_mult=fast_vol_mult,
+        vol_ref_period=vol_ref_period,
+    )
     return _slim_df(df_m)
 
 
@@ -253,43 +296,257 @@ def run_grid(df):
 
 
 def run_baseline_15m(df):
-    """Run baseline strategy on 15m data (most recent 1 year)."""
+    """Run baseline strategy on 15m data (full history from 2021-01-01).
+
+    Parameters mirror the proven 1h baseline (D_nv<+0.5) with all time-based
+    bar counts scaled ×4 for 15m granularity:
+      velocity_bars=32  (8h), fast_velocity_bars=8  (2h),
+      TimeBarStop=192 bars (48h = 2 days), SL=-2%.
+    """
     b = BASELINE_15M
-    df_slim = _prepare_data(df, b["cluster_gap_pct"], b["velocity_bars"],
-                            backtest_start="2025-02-18")
+    df_slim = _prepare_data(
+        df, b["cluster_gap_pct"], b["velocity_bars"],
+        backtest_start="2021-01-01",
+        vp_windows=b.get("vp_windows"),
+        fast_velocity_bars=b["fast_velocity_bars"],
+    )
     bh_ret, bh_1y = _compute_bh(df_slim)
 
-    prox = b["proximity_pct"]
-    decel = b["min_decel"]
+    prox    = b["proximity_pct"]
+    decel   = b["min_decel"]
+    v_ceil  = b["velocity_ceil_long"]
+    v_floor = b["velocity_floor_short"]
 
     results = []
 
     results.append(backtest(
         df_slim, "Baseline_15m_L",
-        buy_cond=ReversalLongCond(prox, decel),
+        buy_cond=ReversalLongCond(prox, decel, velocity_ceil=v_ceil),
         sell_cond=NearResistanceCond(0.002),
-        close_conditions=[StopLossCond(threshold=-0.02)],
+        close_conditions=BASELINE_15M_SL,
     ))
 
     results.append(backtest(
         df_slim, "Baseline_15m_S",
         buy_cond=lambda row: False,
         sell_cond=lambda row: False,
-        short_cond=ReversalShortCond(prox, decel),
+        short_cond=ReversalShortCond(prox, decel, velocity_floor=v_floor),
         cover_cond=NearSupportCond(0.002),
-        close_conditions=[StopLossCond(threshold=-0.02)],
+        close_conditions=BASELINE_15M_SL,
     ))
 
     results.append(backtest(
         df_slim, "Baseline_15m_D",
-        buy_cond=ReversalLongCond(prox, decel),
+        buy_cond=ReversalLongCond(prox, decel, velocity_ceil=v_ceil),
         sell_cond=NearResistanceCond(0.002),
-        short_cond=ReversalShortCond(prox, decel),
+        short_cond=ReversalShortCond(prox, decel, velocity_floor=v_floor),
         cover_cond=NearSupportCond(0.002),
-        close_conditions=[StopLossCond(threshold=-0.02)],
+        close_conditions=BASELINE_15M_SL,
     ))
 
     return results, bh_ret, bh_1y
+
+
+def run_optimization_15m(df):
+    """15m parameter walk-forward optimization.
+
+    Strategy:
+      Phase 1 — Dual-direction grid on train set  (~48 combos, ~7 min)
+      Phase 2 — Validate top-15 D configs on val  (~15 backtests)
+      Phase 3 — L / S breakdown for best-5 configs (~10 backtests)
+
+    Train  : 2022-01-01 ~ 2025-05-31  (~119k 15m bars)
+    Validate: 2025-06-01 ~ latest      (~25k 15m bars)
+
+    Fixed : cluster_gap_pct=0.01, vp_windows=[7,14,30], SL=-2%+Time192b
+    Grid  (coarse but covers key axes):
+        velocity_bars      [16, 32, 48]   (4h / 8h / 12h)
+        fast_velocity_bars [2, 8]         (30m / 2h)  — must be < vb
+        proximity_pct      [0.003, 0.007] (tight / loose proximity)
+        min_decel          [0.5, 1.5, 3.0]
+        velocity_ceil_long [0.0, 0.5]     (wait for fall / allow slight bounce)
+    Phase-1 total (D only): 3×2×2×3×2 = 72 combos  (~10 min on train)
+    """
+    TRAIN_START = "2022-01-01"
+    TRAIN_END   = "2025-05-31"
+    VAL_START   = "2025-06-01"
+    TOP_D       = 15   # top Dual candidates to validate
+
+    b    = BASELINE_15M
+    cgap = b["cluster_gap_pct"]
+    vp_w = b["vp_windows"]
+    sl   = BASELINE_15M_SL
+
+    vb_list    = [16, 32, 48]
+    fvb_list   = [2, 8]           # fast_velocity_bars — skipped if >= vb
+    prox_list  = [0.003, 0.007]
+    decel_list = [0.5, 1.5, 3.0]
+    vceil_list = [0.0, 0.5]
+
+    # ── 1. S/R levels (uses pre-computed VP columns from load_data) ───────────
+    print("  Computing S/R levels...", flush=True)
+    # Trim first so the Python for-loop runs over fewer rows
+    df_base = df[df["date"] >= TRAIN_START].reset_index(drop=True).copy()
+    df_base.attrs = df.attrs.copy()
+    df_sr   = add_sr_levels(df_base, vp_windows=vp_w, cluster_gap_pct=cgap)
+    df_sr.attrs = df_base.attrs.copy()
+
+    df_train_base = df_sr[df_sr["date"] <= TRAIN_END].reset_index(drop=True)
+    df_train_base.attrs = df_sr.attrs.copy()
+    df_val_base   = df_sr[df_sr["date"] >= VAL_START].reset_index(drop=True)
+    df_val_base.attrs = df_sr.attrs.copy()
+
+    bh_train = (df_train_base["close"].iloc[-1] / df_train_base["close"].iloc[0] - 1) * 100
+    bh_val   = (df_val_base["close"].iloc[-1]   / df_val_base["close"].iloc[0]   - 1) * 100
+
+    # Count valid (vb, fvb) pairs
+    valid_pairs = [(vb, fvb) for vb in vb_list for fvb in fvb_list if fvb < vb]
+    phase1_total = len(valid_pairs) * len(prox_list) * len(decel_list) * len(vceil_list)
+    print(f"  Phase 1: {phase1_total} Dual combos on train "
+          f"{TRAIN_START}~{TRAIN_END} ({len(df_train_base)} bars)")
+    print(f"  Val period: {VAL_START}~latest ({len(df_val_base)} bars)")
+    print(f"  BH train={bh_train:+.1f}%  val={bh_val:+.1f}%", flush=True)
+
+    # ── 2. Momentum cache: compute once per (vb, fvb) pair ───────────────────
+    momentum_cache = {}  # (vb, fvb) -> (df_train_slim, df_val_slim)
+    for vb, fvb in valid_pairs:
+        df_tm = _slim_df(add_momentum_indicators(
+            df_train_base.copy(), velocity_bars=vb, fast_velocity_bars=fvb))
+        df_vm = _slim_df(add_momentum_indicators(
+            df_val_base.copy(),   velocity_bars=vb, fast_velocity_bars=fvb))
+        momentum_cache[(vb, fvb)] = (df_tm, df_vm)
+
+    # ── 3. Phase 1: Dual-direction grid on training set ───────────────────────
+    d_results = []   # (tag, vb, fvb, prox, decel, vceil, result_train)
+    count = 0
+    for vb, fvb in valid_pairs:
+        df_tm, _ = momentum_cache[(vb, fvb)]
+        for prox in prox_list:
+            for decel in decel_list:
+                for vceil in vceil_list:
+                    vfloor = -vceil if vceil > 0 else 0.0
+                    tag = (f"vb{vb}_fvb{fvb}"
+                           f"_px{prox*1000:.0f}"
+                           f"_dc{decel:.1f}"
+                           f"_vc{vceil:.1f}")
+                    r = backtest(
+                        df_tm, f"D_{tag}",
+                        buy_cond=ReversalLongCond(prox, decel, velocity_ceil=vceil),
+                        sell_cond=NearResistanceCond(0.002),
+                        short_cond=ReversalShortCond(prox, decel, velocity_floor=vfloor),
+                        cover_cond=NearSupportCond(0.002),
+                        close_conditions=sl,
+                    )
+                    d_results.append((tag, vb, fvb, prox, decel, vceil, r))
+                    count += 1
+                    if count % 36 == 0 or count == phase1_total:
+                        print(f"  Phase 1 progress: {count}/{phase1_total}", flush=True)
+
+    # Sort by train Sharpe
+    d_results.sort(key=lambda x: x[6]["sharpe"], reverse=True)
+    top_d = [x for x in d_results if x[6]["trades"] > 0][:TOP_D]
+
+    # ── 4. Phase 2: Validate top Dual configs on val set ─────────────────────
+    print(f"\n  Phase 2: validating top {len(top_d)} Dual configs on val set...",
+          flush=True)
+
+    def _run_dual(df_slim, tag, prox, decel, vceil):
+        vfloor = -vceil if vceil > 0 else 0.0
+        return backtest(
+            df_slim, f"D_{tag}",
+            buy_cond=ReversalLongCond(prox, decel, velocity_ceil=vceil),
+            sell_cond=NearResistanceCond(0.002),
+            short_cond=ReversalShortCond(prox, decel, velocity_floor=vfloor),
+            cover_cond=NearSupportCond(0.002),
+            close_conditions=sl,
+        )
+
+    val_d = []
+    for tag, vb, fvb, prox, decel, vceil, tr in top_d:
+        _, df_vm = momentum_cache[(vb, fvb)]
+        vr = _run_dual(df_vm, tag, prox, decel, vceil)
+        val_d.append((tag, vb, fvb, prox, decel, vceil, tr, vr))
+
+    # ── 5. Phase 3: L / S breakdown for best 5 Dual configs ──────────────────
+    # Rank val_d by combined score: val_sharpe × sign(val_ret)
+    val_d_sorted = sorted(
+        val_d,
+        key=lambda x: x[7]["sharpe"] if x[7]["total_return"] > 0 else -99,
+        reverse=True,
+    )
+    best5 = val_d_sorted[:5]
+
+    print(f"\n  Phase 3: L/S breakdown for top-5 configs...", flush=True)
+    ls_results = []  # (tag, vb, fvb, prox, decel, vceil, dir, tr, vr)
+    for tag, vb, fvb, prox, decel, vceil, _, _ in best5:
+        vfloor = -vceil if vceil > 0 else 0.0
+        df_tm, df_vm = momentum_cache[(vb, fvb)]
+        for direction in ["L", "S"]:
+            if direction == "L":
+                tr = backtest(df_tm, f"L_{tag}",
+                              buy_cond=ReversalLongCond(prox, decel, velocity_ceil=vceil),
+                              sell_cond=NearResistanceCond(0.002),
+                              close_conditions=sl)
+                vr = backtest(df_vm, f"L_{tag}",
+                              buy_cond=ReversalLongCond(prox, decel, velocity_ceil=vceil),
+                              sell_cond=NearResistanceCond(0.002),
+                              close_conditions=sl)
+            else:
+                tr = backtest(df_tm, f"S_{tag}",
+                              buy_cond=lambda row: False,
+                              sell_cond=lambda row: False,
+                              short_cond=ReversalShortCond(prox, decel, velocity_floor=vfloor),
+                              cover_cond=NearSupportCond(0.002),
+                              close_conditions=sl)
+                vr = backtest(df_vm, f"S_{tag}",
+                              buy_cond=lambda row: False,
+                              sell_cond=lambda row: False,
+                              short_cond=ReversalShortCond(prox, decel, velocity_floor=vfloor),
+                              cover_cond=NearSupportCond(0.002),
+                              close_conditions=sl)
+            ls_results.append((tag, vb, fvb, prox, decel, vceil, direction, tr, vr))
+
+    # ── 6. Print results ──────────────────────────────────────────────────────
+    W = 114
+    def _header(title, bh_t, bh_v):
+        print(f"\n{'='*W}")
+        print(f"  {title}   BH train={bh_t:+.1f}%  val={bh_v:+.1f}%")
+        print(f"{'='*W}")
+        print(f"  {'':2}{'vb':>4} {'fvb':>4} {'px':>5} {'dc':>5} {'vc':>5}"
+              f"  {'TrRet':>7} {'TrShr':>6} {'TrMDD':>7} {'TrN':>5}"
+              f"  {'VaRet':>7} {'VaShr':>6} {'VaMDD':>7} {'VaN':>5}")
+        print("  " + "-" * (W - 2))
+
+    def _row(tag, vb, fvb, prox, decel, vceil, tr, vr, prefix=""):
+        ok = "*" if vr["sharpe"] > 0.3 and vr["total_return"] > 0 else " "
+        print(f"  {ok}{prefix:1}{vb:>4} {fvb:>4} {prox*1000:>5.0f}"
+              f" {decel:>5.1f} {vceil:>5.1f}"
+              f"  {tr['total_return']:>6.1f}% {tr['sharpe']:>6.3f}"
+              f" {tr['max_drawdown']:>6.1f}% {tr['trades']:>5}"
+              f"  {vr['total_return']:>6.1f}% {vr['sharpe']:>6.3f}"
+              f" {vr['max_drawdown']:>6.1f}% {vr['trades']:>5}")
+
+    # Dual top-15
+    _header("DUAL — Top-15 by train Sharpe (validated on val set)",
+            bh_train, bh_val)
+    for tag, vb, fvb, prox, decel, vceil, tr, vr in val_d:
+        _row(tag, vb, fvb, prox, decel, vceil, tr, vr)
+
+    # Re-sort by val Sharpe for the "best in val" view
+    val_d_by_val = sorted(val_d,
+                          key=lambda x: x[7]["sharpe"], reverse=True)
+    _header("DUAL — Same configs sorted by VAL Sharpe",
+            bh_train, bh_val)
+    for tag, vb, fvb, prox, decel, vceil, tr, vr in val_d_by_val:
+        _row(tag, vb, fvb, prox, decel, vceil, tr, vr)
+
+    # L/S breakdown for best 5
+    _header("LONG / SHORT breakdown for best-5 Dual configs",
+            bh_train, bh_val)
+    for tag, vb, fvb, prox, decel, vceil, direction, tr, vr in ls_results:
+        _row(tag, vb, fvb, prox, decel, vceil, tr, vr, prefix=direction)
+
+    return bh_train, bh_val
 
 
 def run_grid_15m(df):
@@ -931,19 +1188,649 @@ def run_stoploss_grid(df):
     return all_results, bh_ret, bh_1y
 
 
+def run_wbottom_grid(df):
+    """Grid search for W-bottom/M-top microstructure filter thresholds."""
+    b = BASELINE
+    df_slim = _prepare_data(df, b["cluster_gap_pct"], b["velocity_bars"])
+    bh_ret, bh_1y = _compute_bh(df_slim)
+
+    prox = b["proximity_pct"]
+    decel = b["min_decel"]
+    v_ceil = b["velocity_ceil_long"]
+    v_floor = b["velocity_floor_short"]
+    sl = BASELINE_SL
+
+    strength_thresholds = [0.3, 0.5, 0.7, 1.0]
+    all_results = []
+    count = 0
+
+    # Baseline (no W/M filter) as reference
+    for direction in ["L", "S", "D"]:
+        tag = "NoWM"
+        if direction == "L":
+            all_results.append(backtest(
+                df_slim, f"L_{tag}",
+                buy_cond=ReversalLongCond(prox, decel, velocity_ceil=v_ceil),
+                sell_cond=NearResistanceCond(0.002),
+                close_conditions=sl,
+            ))
+        elif direction == "S":
+            all_results.append(backtest(
+                df_slim, f"S_{tag}",
+                buy_cond=lambda row: False,
+                sell_cond=lambda row: False,
+                short_cond=ReversalShortCond(prox, decel, velocity_floor=v_floor),
+                cover_cond=NearSupportCond(0.002),
+                close_conditions=sl,
+            ))
+        else:
+            all_results.append(backtest(
+                df_slim, f"D_{tag}",
+                buy_cond=ReversalLongCond(prox, decel, velocity_ceil=v_ceil),
+                sell_cond=NearResistanceCond(0.002),
+                short_cond=ReversalShortCond(prox, decel, velocity_floor=v_floor),
+                cover_cond=NearSupportCond(0.002),
+                close_conditions=sl,
+            ))
+        count += 1
+
+    # Grid: W-bottom strength thresholds for Long, M-top for Short
+    total = 3 + len(strength_thresholds) * 3 * 2  # baseline + thresholds × directions × (w/m)
+    for thresh in strength_thresholds:
+        tag_w = f"W{thresh:.1f}"
+        tag_m = f"M{thresh:.1f}"
+        tag_wm = f"WM{thresh:.1f}"
+
+        # Long with W-bottom filter
+        all_results.append(backtest(
+            df_slim, f"L_{tag_w}",
+            buy_cond=ReversalLongCond(prox, decel, velocity_ceil=v_ceil,
+                                      min_w_strength=thresh),
+            sell_cond=NearResistanceCond(0.002),
+            close_conditions=sl,
+        ))
+        count += 1
+
+        # Short with M-top filter
+        all_results.append(backtest(
+            df_slim, f"S_{tag_m}",
+            buy_cond=lambda row: False,
+            sell_cond=lambda row: False,
+            short_cond=ReversalShortCond(prox, decel, velocity_floor=v_floor,
+                                         min_m_strength=thresh),
+            cover_cond=NearSupportCond(0.002),
+            close_conditions=sl,
+        ))
+        count += 1
+
+        # Dual with both filters
+        all_results.append(backtest(
+            df_slim, f"D_{tag_wm}",
+            buy_cond=ReversalLongCond(prox, decel, velocity_ceil=v_ceil,
+                                      min_w_strength=thresh),
+            sell_cond=NearResistanceCond(0.002),
+            short_cond=ReversalShortCond(prox, decel, velocity_floor=v_floor,
+                                         min_m_strength=thresh),
+            cover_cond=NearSupportCond(0.002),
+            close_conditions=sl,
+        ))
+        count += 1
+
+        # Long with W filter only (no M on short side) in Dual
+        all_results.append(backtest(
+            df_slim, f"D_Wonly{thresh:.1f}",
+            buy_cond=ReversalLongCond(prox, decel, velocity_ceil=v_ceil,
+                                      min_w_strength=thresh),
+            sell_cond=NearResistanceCond(0.002),
+            short_cond=ReversalShortCond(prox, decel, velocity_floor=v_floor),
+            cover_cond=NearSupportCond(0.002),
+            close_conditions=sl,
+        ))
+        count += 1
+
+        # Short with M filter only (no W on long side) in Dual
+        all_results.append(backtest(
+            df_slim, f"D_Monly{thresh:.1f}",
+            buy_cond=ReversalLongCond(prox, decel, velocity_ceil=v_ceil),
+            sell_cond=NearResistanceCond(0.002),
+            short_cond=ReversalShortCond(prox, decel, velocity_floor=v_floor,
+                                         min_m_strength=thresh),
+            cover_cond=NearSupportCond(0.002),
+            close_conditions=sl,
+        ))
+        count += 1
+
+        # Asymmetric: different thresholds for W vs M
+        for thresh2 in strength_thresholds:
+            if thresh2 == thresh:
+                continue
+            all_results.append(backtest(
+                df_slim, f"D_W{thresh:.1f}M{thresh2:.1f}",
+                buy_cond=ReversalLongCond(prox, decel, velocity_ceil=v_ceil,
+                                          min_w_strength=thresh),
+                sell_cond=NearResistanceCond(0.002),
+                short_cond=ReversalShortCond(prox, decel, velocity_floor=v_floor,
+                                             min_m_strength=thresh2),
+                cover_cond=NearSupportCond(0.002),
+                close_conditions=sl,
+            ))
+            count += 1
+
+        if count % 10 == 0:
+            print(f"  Progress: {count} combos done")
+
+    print(f"  Total: {count} combos")
+    return all_results, bh_ret, bh_1y
+
+
+def _win_rate_from_log(trade_log: list) -> float:
+    """Compute overall win rate (%) from a trade log list."""
+    pairs = []
+    for i, t in enumerate(trade_log):
+        if t["type"] == "SELL":
+            for j in range(i - 1, -1, -1):
+                if trade_log[j]["type"] == "BUY":
+                    pnl = (t["price"] / trade_log[j]["price"] - 1) * 100
+                    pairs.append(pnl)
+                    break
+        elif t["type"] == "COVER":
+            for j in range(i - 1, -1, -1):
+                if trade_log[j]["type"] == "SHORT":
+                    pnl = (trade_log[j]["price"] / t["price"] - 1) * 100
+                    pairs.append(pnl)
+                    break
+    if not pairs:
+        return 0.0
+    return len([p for p in pairs if p > 0]) / len(pairs) * 100
+
+
+def run_sensitivity(df):
+    """One-at-a-time parameter sensitivity analysis for the baseline strategy.
+
+    Varies each parameter individually while holding all others at baseline values.
+    Reports Dual direction results only (the proven best).
+    Output: one formatted table per parameter showing Return, Sharpe, MaxDD,
+    1Y-Sharpe, Trades, WinRate. Baseline value marked with *.
+    """
+    b = BASELINE
+    BASELINE_EXIT_PROX = 0.002  # NearResistanceCond / NearSupportCond proximity
+
+    def _m(r):
+        """Extract key metrics dict from a backtest result.
+        Note: total_return / max_drawdown / return_1y are already in % form."""
+        return {
+            "ret":       r["total_return"],
+            "sharpe":    r["sharpe"],
+            "maxdd":     r["max_drawdown"],
+            "ret_1y":    r.get("return_1y") or 0,
+            "sharpe_1y": r.get("sharpe_1y") or 0,
+            "trades":    r["trades"],
+            "wr":        _win_rate_from_log(r.get("trade_log", [])),
+        }
+
+    def _print_table(param_name, baseline_val, rows):
+        SEP = "=" * 80
+        print(f"\n{SEP}")
+        print(f"  SENSITIVITY: {param_name}  (baseline = {baseline_val})")
+        print(SEP)
+        hdr = (f"  {'Value':<14} {'Return':>9} {'Sharpe':>8} {'MaxDD':>8}"
+               f" {'1Y Ret':>9} {'1Y Shrp':>8} {'Trades':>7} {'WinRate':>8}")
+        print(hdr)
+        print("  " + "-" * 78)
+        for val, m in rows:
+            mark = "* " if val == baseline_val else "  "
+            val_s = f"{val}" if not isinstance(val, float) else f"{val:.4g}"
+            print(f"{mark}{val_s:<14} {m['ret']:>8.1f}% {m['sharpe']:>7.3f}"
+                  f" {m['maxdd']:>7.1f}% {m['ret_1y']:>8.1f}% {m['sharpe_1y']:>7.3f}"
+                  f" {m['trades']:>7} {m['wr']:>7.1f}%")
+
+    def _dual(df_slim, prox, decel, v_ceil, ep, sl_conds):
+        return backtest(
+            df_slim, "D",
+            buy_cond=ReversalLongCond(prox, decel, velocity_ceil=v_ceil),
+            sell_cond=NearResistanceCond(ep),
+            short_cond=ReversalShortCond(prox, decel, velocity_floor=-v_ceil),
+            cover_cond=NearSupportCond(ep),
+            close_conditions=sl_conds,
+        )
+
+    # Pre-compute S/R levels once (reused for all params except cluster_gap_pct)
+    df_sr = add_sr_levels(df.copy(), vp_windows=VP_WINDOWS,
+                          cluster_gap_pct=b["cluster_gap_pct"])
+    df_bt = df_sr[df_sr["date"] >= "2021-01-01"].reset_index(drop=True)
+    df_bt.attrs = df_sr.attrs.copy()
+    bh_ret, bh_1y = _compute_bh(df_bt)
+
+    # Pre-compute momentum indicators at baseline velocity_bars
+    df_slim_base = _slim_df(add_momentum_indicators(df_bt.copy(),
+                                                     velocity_bars=b["velocity_bars"]))
+
+    prox0  = b["proximity_pct"]
+    decel0 = b["min_decel"]
+    vceil0 = b["velocity_ceil_long"]
+    ep0    = BASELINE_EXIT_PROX
+    sl0    = BASELINE_SL
+
+    # ------------------------------------------------------------------
+    # 1. velocity_bars  (requires re-computing momentum indicators)
+    # ------------------------------------------------------------------
+    print("\n[Sensitivity 1/8] velocity_bars ...")
+    vb_list = [2, 4, 6, 8, 10, 12, 16, 20, 24]
+    vb_rows = []
+    for vb in vb_list:
+        df_m = _slim_df(add_momentum_indicators(df_bt.copy(), velocity_bars=vb))
+        vb_rows.append((vb, _m(_dual(df_m, prox0, decel0, vceil0, ep0, sl0))))
+    _print_table("velocity_bars  (1h bars)", b["velocity_bars"], vb_rows)
+
+    # ------------------------------------------------------------------
+    # 2. proximity_pct  (reuse base slim df)
+    # ------------------------------------------------------------------
+    print("\n[Sensitivity 2/8] proximity_pct ...")
+    prox_list = [0.002, 0.003, 0.005, 0.007, 0.010, 0.015, 0.020]
+    prox_rows = []
+    for prox in prox_list:
+        prox_rows.append((prox, _m(_dual(df_slim_base, prox, decel0, vceil0, ep0, sl0))))
+    _print_table("proximity_pct  (entry S/R distance)", prox0, prox_rows)
+
+    # ------------------------------------------------------------------
+    # 3. min_decel
+    # ------------------------------------------------------------------
+    print("\n[Sensitivity 3/8] min_decel ...")
+    decel_list = [0.30, 0.50, 0.75, 1.00, 1.25, 1.50, 2.00, 2.50, 3.00]
+    decel_rows = []
+    for dc in decel_list:
+        decel_rows.append((dc, _m(_dual(df_slim_base, prox0, dc, vceil0, ep0, sl0))))
+    _print_table("min_decel  (velocity_delta threshold)", decel0, decel_rows)
+
+    # ------------------------------------------------------------------
+    # 4. velocity_ceil_long  (and symmetric velocity_floor_short = -ceil)
+    # ------------------------------------------------------------------
+    print("\n[Sensitivity 4/8] velocity_ceil_long ...")
+    vceil_list = [-1.0, -0.5, 0.0, 0.3, 0.5, 1.0, 1.5, 2.0]
+    vceil_rows = []
+    for vc in vceil_list:
+        vceil_rows.append((vc, _m(_dual(df_slim_base, prox0, decel0, vc, ep0, sl0))))
+    _print_table("velocity_ceil_long  (+-symmetric, entry nv bound)", vceil0, vceil_rows)
+
+    # ------------------------------------------------------------------
+    # 5. stop_loss_threshold  (keep TimeBarStop=48 as partner)
+    # ------------------------------------------------------------------
+    print("\n[Sensitivity 5/8] stop_loss_threshold ...")
+    sl_list = [-0.005, -0.010, -0.015, -0.020, -0.025, -0.030, -0.040, -0.050]
+    sl_rows = []
+    for sl_thresh in sl_list:
+        sl_conds = [StopLossCond(sl_thresh), TimeBarStopCond(48)]
+        sl_rows.append((sl_thresh, _m(_dual(df_slim_base, prox0, decel0, vceil0, ep0, sl_conds))))
+    _print_table("stop_loss_threshold  (with Time48)", -0.02, sl_rows)
+
+    # ------------------------------------------------------------------
+    # 6. time_stop_bars  (paired with -2% fixed SL)
+    # ------------------------------------------------------------------
+    print("\n[Sensitivity 6/8] time_stop_bars ...")
+    ts_list = [None, 12, 24, 36, 48, 72, 96, 120, 168]
+    ts_rows = []
+    for ts in ts_list:
+        sl_conds = ([StopLossCond(-0.02), TimeBarStopCond(ts)]
+                    if ts is not None else [StopLossCond(-0.02)])
+        ts_rows.append((ts, _m(_dual(df_slim_base, prox0, decel0, vceil0, ep0, sl_conds))))
+    _print_table("time_stop_bars  (with -2% SL; None = disabled)", 48, ts_rows)
+
+    # ------------------------------------------------------------------
+    # 7. exit_proximity  (NearResistanceCond / NearSupportCond)
+    # ------------------------------------------------------------------
+    print("\n[Sensitivity 7/8] exit_proximity ...")
+    ep_list = [0.001, 0.002, 0.003, 0.005, 0.007, 0.010, 0.015]
+    ep_rows = []
+    for ep in ep_list:
+        ep_rows.append((ep, _m(_dual(df_slim_base, prox0, decel0, vceil0, ep, sl0))))
+    _print_table("exit_proximity  (NearRes/Sup trigger distance)", ep0, ep_rows)
+
+    # ------------------------------------------------------------------
+    # 8. cluster_gap_pct  (requires re-computing S/R levels)
+    # ------------------------------------------------------------------
+    print("\n[Sensitivity 8/8] cluster_gap_pct ...")
+    cgap_list = [0.005, 0.007, 0.010, 0.015, 0.020, 0.030]
+    cgap_rows = []
+    for cgap in cgap_list:
+        df_slim = _prepare_data(df, cgap, b["velocity_bars"])
+        cgap_rows.append((cgap, _m(_dual(df_slim, prox0, decel0, vceil0, ep0, sl0))))
+    _print_table("cluster_gap_pct  (S/R level merging gap)", b["cluster_gap_pct"], cgap_rows)
+
+    return bh_ret, bh_1y
+
+
+# ============================================================================
+# VOLUME-CLOCK BASELINE CONFIG
+# ============================================================================
+
+# Volume-clock baseline: velocity_vol_mult=8 ≈ 8× median hourly volume ≈ 8 h
+# at normal activity.  SL=-2% + Time48 same as time-based baseline.
+VOL_BASELINE = {
+    "velocity_vol_mult": 8.0,     # ≈ 8h of typical hourly volume
+    "fast_vol_mult": 2.0,          # ≈ 2h of typical hourly volume
+    "vol_ref_period": 168,         # 1-week rolling median for reference vol
+    "proximity_pct": 0.005,
+    "min_decel": 1.5,
+    "cluster_gap_pct": 0.01,
+    "velocity_ceil_long": 0.5,
+    "velocity_floor_short": -0.5,
+}
+VOL_BASELINE_SL = [StopLossCond(-0.02), TimeBarStopCond(48)]
+
+TRAIN_START_VOL = "2021-01-01"
+TRAIN_END_VOL   = "2025-05-31"
+VAL_START_VOL   = "2025-06-01"
+
+
+def run_vol_baseline(df):
+    """Run volume-clock baseline on full history (2021-present)."""
+    b = VOL_BASELINE
+    df_slim = _prepare_vol_data(
+        df,
+        cluster_gap_pct=b["cluster_gap_pct"],
+        velocity_vol_mult=b["velocity_vol_mult"],
+        fast_vol_mult=b["fast_vol_mult"],
+        vol_ref_period=b["vol_ref_period"],
+        backtest_start=TRAIN_START_VOL,
+    )
+    bh_ret, bh_1y = _compute_bh(df_slim)
+
+    prox   = b["proximity_pct"]
+    decel  = b["min_decel"]
+    v_ceil = b["velocity_ceil_long"]
+    v_floor = b["velocity_floor_short"]
+
+    results = []
+
+    results.append(backtest(
+        df_slim, "VolBaseline_L",
+        buy_cond=VolumeReversalLongCond(prox, decel, velocity_ceil=v_ceil),
+        sell_cond=NearResistanceCond(0.002),
+        close_conditions=VOL_BASELINE_SL,
+    ))
+
+    results.append(backtest(
+        df_slim, "VolBaseline_S",
+        buy_cond=lambda row: False,
+        sell_cond=lambda row: False,
+        short_cond=VolumeReversalShortCond(prox, decel, velocity_floor=v_floor),
+        cover_cond=NearSupportCond(0.002),
+        close_conditions=VOL_BASELINE_SL,
+    ))
+
+    results.append(backtest(
+        df_slim, "VolBaseline_D",
+        buy_cond=VolumeReversalLongCond(prox, decel, velocity_ceil=v_ceil),
+        sell_cond=NearResistanceCond(0.002),
+        short_cond=VolumeReversalShortCond(prox, decel, velocity_floor=v_floor),
+        cover_cond=NearSupportCond(0.002),
+        close_conditions=VOL_BASELINE_SL,
+    ))
+
+    return results, bh_ret, bh_1y
+
+
+def run_vol_optimization(df):
+    """
+    Volume-clock walk-forward optimisation.
+
+    Train  : 2021-01-01 ~ 2025-05-31
+    Validate: 2025-06-01 ~ latest
+
+    Strategy: volume-clock S/R mean-reversion (dual direction).
+    Volume clock adapts lookback to cumulative traded volume instead of
+    fixed bar counts, so high-activity periods have compressed lookbacks.
+
+    Phase 1 — Dual grid on train (~54 combos)
+    Phase 2 — Validate top-15 D configs on val set
+    Phase 3 — L/S breakdown for best-5 Dual configs
+
+    Grid axes:
+        velocity_vol_mult  [4, 8, 12, 16]   (≈ 4h / 8h / 12h / 16h avg vol)
+        fast_vol_mult      [1, 2, 4]        (≈ 1h / 2h / 4h avg vol)
+        proximity_pct      [0.003, 0.005, 0.010]
+        min_decel          [0.5, 1.0, 1.5, 2.0]
+        velocity_ceil_long [0.0, 0.5]
+    Fixed: cluster_gap_pct=0.01, vol_ref_period=168, SL=-2%+Time48
+    """
+    cgap    = VOL_BASELINE["cluster_gap_pct"]
+    vp_w    = VP_WINDOWS
+    sl      = VOL_BASELINE_SL
+    ref_per = VOL_BASELINE["vol_ref_period"]
+    TOP_D   = 15
+
+    vvm_list   = [4.0, 8.0, 12.0, 16.0]
+    fvm_list   = [1.0, 2.0, 4.0]
+    prox_list  = [0.003, 0.005, 0.010]
+    decel_list = [0.5, 1.0, 1.5, 2.0]
+    vceil_list = [0.0, 0.5]
+
+    # ── 1. S/R levels on full data ────────────────────────────────────────────
+    print("  Computing S/R levels...", flush=True)
+    df_base = df[df["date"] >= TRAIN_START_VOL].reset_index(drop=True).copy()
+    df_base.attrs = df.attrs.copy()
+    df_sr = add_sr_levels(df_base, vp_windows=vp_w, cluster_gap_pct=cgap)
+    df_sr.attrs = df_base.attrs.copy()
+
+    df_train_base = df_sr[df_sr["date"] <= TRAIN_END_VOL].reset_index(drop=True)
+    df_train_base.attrs = df_sr.attrs.copy()
+    df_val_base   = df_sr[df_sr["date"] >= VAL_START_VOL].reset_index(drop=True)
+    df_val_base.attrs = df_sr.attrs.copy()
+
+    bh_train = (df_train_base["close"].iloc[-1]
+                / df_train_base["close"].iloc[0] - 1) * 100
+    bh_val   = (df_val_base["close"].iloc[-1]
+                / df_val_base["close"].iloc[0] - 1) * 100
+
+    # Valid (vvm, fvm) pairs: fast window must be strictly smaller
+    valid_pairs = [(vvm, fvm) for vvm in vvm_list for fvm in fvm_list if fvm < vvm]
+    phase1_total = (len(valid_pairs) * len(prox_list)
+                    * len(decel_list) * len(vceil_list))
+    print(f"  Phase 1: {phase1_total} Dual combos on train "
+          f"{TRAIN_START_VOL}~{TRAIN_END_VOL} ({len(df_train_base)} bars)")
+    print(f"  Val period: {VAL_START_VOL}~latest ({len(df_val_base)} bars)")
+    print(f"  BH train={bh_train:+.1f}%  val={bh_val:+.1f}%", flush=True)
+
+    # ── 2. Volume indicator cache (compute once per (vvm, fvm) pair) ──────────
+    mom_cache = {}   # (vvm, fvm) -> (df_train_slim, df_val_slim)
+    for vvm, fvm in valid_pairs:
+        df_tm = _slim_df(add_volume_momentum_indicators(
+            df_train_base.copy(), velocity_vol_mult=vvm,
+            fast_vol_mult=fvm, vol_ref_period=ref_per))
+        df_vm = _slim_df(add_volume_momentum_indicators(
+            df_val_base.copy(), velocity_vol_mult=vvm,
+            fast_vol_mult=fvm, vol_ref_period=ref_per))
+        mom_cache[(vvm, fvm)] = (df_tm, df_vm)
+
+    # ── 3. Phase 1: Dual-direction grid on training set ───────────────────────
+    d_results = []   # (tag, vvm, fvm, prox, decel, vceil, result_train)
+    count = 0
+    for vvm, fvm in valid_pairs:
+        df_tm, _ = mom_cache[(vvm, fvm)]
+        for prox in prox_list:
+            for decel in decel_list:
+                for vceil in vceil_list:
+                    vfloor = -vceil if vceil > 0 else 0.0
+                    tag = (f"vvm{vvm:.0f}_fvm{fvm:.0f}"
+                           f"_px{prox*1000:.0f}"
+                           f"_dc{decel:.1f}"
+                           f"_vc{vceil:.1f}")
+                    r = backtest(
+                        df_tm, f"D_{tag}",
+                        buy_cond=VolumeReversalLongCond(prox, decel,
+                                                        velocity_ceil=vceil),
+                        sell_cond=NearResistanceCond(0.002),
+                        short_cond=VolumeReversalShortCond(prox, decel,
+                                                           velocity_floor=vfloor),
+                        cover_cond=NearSupportCond(0.002),
+                        close_conditions=sl,
+                    )
+                    d_results.append((tag, vvm, fvm, prox, decel, vceil, r))
+                    count += 1
+                    if count % 36 == 0 or count == phase1_total:
+                        print(f"  Phase 1 progress: {count}/{phase1_total}",
+                              flush=True)
+
+    # Sort by train Sharpe
+    d_results.sort(key=lambda x: x[6]["sharpe"], reverse=True)
+    top_d = [x for x in d_results if x[6]["trades"] > 0][:TOP_D]
+
+    # ── 4. Phase 2: Validate top Dual configs on val set ─────────────────────
+    print(f"\n  Phase 2: validating top {len(top_d)} Dual configs on val set...",
+          flush=True)
+
+    def _run_dual_vol(df_slim, tag, prox, decel, vceil):
+        vfloor = -vceil if vceil > 0 else 0.0
+        return backtest(
+            df_slim, f"D_{tag}",
+            buy_cond=VolumeReversalLongCond(prox, decel, velocity_ceil=vceil),
+            sell_cond=NearResistanceCond(0.002),
+            short_cond=VolumeReversalShortCond(prox, decel, velocity_floor=vfloor),
+            cover_cond=NearSupportCond(0.002),
+            close_conditions=sl,
+        )
+
+    val_d = []
+    for tag, vvm, fvm, prox, decel, vceil, tr in top_d:
+        _, df_vm = mom_cache[(vvm, fvm)]
+        vr = _run_dual_vol(df_vm, tag, prox, decel, vceil)
+        val_d.append((tag, vvm, fvm, prox, decel, vceil, tr, vr))
+
+    # ── 5. Phase 3: L/S breakdown for best-5 Dual configs ─────────────────────
+    val_d_sorted = sorted(
+        val_d,
+        key=lambda x: x[7]["sharpe"] if x[7]["total_return"] > 0 else -99,
+        reverse=True,
+    )
+    best5 = val_d_sorted[:5]
+
+    print(f"\n  Phase 3: L/S breakdown for top-5 configs...", flush=True)
+    ls_results = []
+    for tag, vvm, fvm, prox, decel, vceil, _, _ in best5:
+        vfloor = -vceil if vceil > 0 else 0.0
+        df_tm, df_vm = mom_cache[(vvm, fvm)]
+        for direction in ["L", "S"]:
+            if direction == "L":
+                tr = backtest(df_tm, f"L_{tag}",
+                              buy_cond=VolumeReversalLongCond(prox, decel,
+                                                              velocity_ceil=vceil),
+                              sell_cond=NearResistanceCond(0.002),
+                              close_conditions=sl)
+                vr = backtest(df_vm, f"L_{tag}",
+                              buy_cond=VolumeReversalLongCond(prox, decel,
+                                                              velocity_ceil=vceil),
+                              sell_cond=NearResistanceCond(0.002),
+                              close_conditions=sl)
+            else:
+                tr = backtest(df_tm, f"S_{tag}",
+                              buy_cond=lambda row: False,
+                              sell_cond=lambda row: False,
+                              short_cond=VolumeReversalShortCond(prox, decel,
+                                                                 velocity_floor=vfloor),
+                              cover_cond=NearSupportCond(0.002),
+                              close_conditions=sl)
+                vr = backtest(df_vm, f"S_{tag}",
+                              buy_cond=lambda row: False,
+                              sell_cond=lambda row: False,
+                              short_cond=VolumeReversalShortCond(prox, decel,
+                                                                 velocity_floor=vfloor),
+                              cover_cond=NearSupportCond(0.002),
+                              close_conditions=sl)
+            ls_results.append((tag, vvm, fvm, prox, decel, vceil, direction, tr, vr))
+
+    # ── 6. Print results ──────────────────────────────────────────────────────
+    W = 120
+    def _hdr(title):
+        print(f"\n{'='*W}")
+        print(f"  {title}   BH train={bh_train:+.1f}%  val={bh_val:+.1f}%")
+        print(f"{'='*W}")
+        print(f"  {'':2}{'vvm':>5} {'fvm':>4} {'px':>5} {'dc':>5} {'vc':>5}"
+              f"  {'TrRet':>7} {'TrShr':>6} {'TrMDD':>7} {'TrN':>5}"
+              f"  {'VaRet':>7} {'VaShr':>6} {'VaMDD':>7} {'VaN':>5}")
+        print("  " + "-" * (W - 2))
+
+    def _row(tag, vvm, fvm, prox, decel, vceil, tr, vr, prefix=""):
+        ok = "*" if vr["sharpe"] > 0.3 and vr["total_return"] > 0 else " "
+        print(f"  {ok}{prefix:1}{vvm:>5.0f} {fvm:>4.0f} {prox*1000:>5.0f}"
+              f" {decel:>5.1f} {vceil:>5.1f}"
+              f"  {tr['total_return']:>6.1f}% {tr['sharpe']:>6.3f}"
+              f" {tr['max_drawdown']:>6.1f}% {tr['trades']:>5}"
+              f"  {vr['total_return']:>6.1f}% {vr['sharpe']:>6.3f}"
+              f" {vr['max_drawdown']:>6.1f}% {vr['trades']:>5}")
+
+    _hdr("DUAL — Top-15 by train Sharpe (validated)")
+    for tag, vvm, fvm, prox, decel, vceil, tr, vr in val_d:
+        _row(tag, vvm, fvm, prox, decel, vceil, tr, vr)
+
+    val_d_by_val = sorted(val_d,
+                          key=lambda x: x[7]["sharpe"], reverse=True)
+    _hdr("DUAL — Same configs sorted by VAL Sharpe")
+    for tag, vvm, fvm, prox, decel, vceil, tr, vr in val_d_by_val:
+        _row(tag, vvm, fvm, prox, decel, vceil, tr, vr)
+
+    _hdr("LONG / SHORT breakdown for best-5 Dual configs")
+    for tag, vvm, fvm, prox, decel, vceil, direction, tr, vr in ls_results:
+        _row(tag, vvm, fvm, prox, decel, vceil, tr, vr, prefix=direction)
+
+    return bh_train, bh_val
+
+
 def main():
     grid_mode = "--grid" in sys.argv
     mode_15m = "--15m" in sys.argv
+    optimize_mode = "--optimize" in sys.argv
     sl_mode = "--sl" in sys.argv
     filter_mode = "--filter" in sys.argv
     velocity_mode = "--velocity" in sys.argv
     fast_mode = "--fast" in sys.argv
     vp_mode = "--vp" in sys.argv
+    wbottom_mode = "--wbottom" in sys.argv
+    sensitivity_mode = "--sensitivity" in sys.argv
+    volbaseline_mode = "--volbaseline" in sys.argv
+
+    if volbaseline_mode:
+        # Volume-clock S/R strategy: 1h data, train 2021-2025.6, val 2025.6+
+        print("===== VOLUME-CLOCK S/R STRATEGY =====")
+        print(f"  Train: {TRAIN_START_VOL} ~ {TRAIN_END_VOL}")
+        print(f"  Val  : {VAL_START_VOL} ~ present")
+        df = load_data(
+            start="2020-01-01",   # extra year for VP + vol_ref_period warmup
+            include_fg=False,
+            include_derivatives=False,
+            include_cb_premium=False,
+            interval="1h",
+        )
+
+        # ── Volume-clock baseline (full period 2021-present) ─────────────────
+        print("\n----- Volume-clock Baseline (full history 2021-present) -----")
+        vol_results, bh_ret, bh_1y = run_vol_baseline(df)
+        print_results(vol_results, buy_and_hold_ret=bh_ret,
+                      buy_and_hold_1y=bh_1y)
+        for res in vol_results:
+            print_yearly_breakdown(res, bars_per_day=24)
+
+        # ── Walk-forward optimisation: train 2021-2025.6 / val 2025.6+ ───────
+        print("\n===== VOLUME-CLOCK WALK-FORWARD OPTIMISATION =====")
+        run_vol_optimization(df)
+
+        # ── Save all results ──────────────────────────────────────────────────
+        active = [r for r in vol_results if r["trades"] > 0]
+        active.sort(key=lambda x: x["sharpe"], reverse=True)
+        save_results_to_files(
+            active,
+            summary_path="results_vol_sr_summary.txt",
+            trade_log_path="trade_logs_vol_sr.txt",
+            buy_and_hold_ret=bh_ret,
+            buy_and_hold_1y=bh_1y,
+        )
+        print(f"\nTotal strategies: {len(active)} active (vol-clock)")
+        return
 
     if mode_15m:
-        # 15m mode: load 15m data with 30d warmup before 1-year backtest
+        # 15m mode: load from 2020-01-01 to cover full 2021-2025 backtest
+        # (VP windows need up to 90d warmup; 1y extra buffer is sufficient)
         df = load_data(
-            start="2024-02-18",
+            start="2020-01-01",
             include_fg=False,
             include_derivatives=False,
             include_cb_premium=False,
@@ -953,9 +1840,16 @@ def main():
         baseline_results, bh_ret, bh_1y = run_baseline_15m(df)
         all_results = list(baseline_results)
 
-        print("\n===== 15m BASELINE (vb32_px5_dc10_cg1) =====")
+        print("\n===== 15m BASELINE (vb32/8h, px0.5%, dc>1.5, SL-2%+Time192b) =====")
         print_results(baseline_results, buy_and_hold_ret=bh_ret,
                       buy_and_hold_1y=bh_1y)
+
+        for res in baseline_results:
+            print_yearly_breakdown(res, bars_per_day=96)
+
+        if optimize_mode:
+            print("\n===== 15m WALK-FORWARD OPTIMIZATION =====")
+            run_optimization_15m(df)
 
         if grid_mode:
             print("\n===== 15m GRID SWEEP =====")
@@ -981,12 +1875,17 @@ def main():
 
     else:
         # 1h mode (original behavior)
+        w_params = None
+        if wbottom_mode:
+            w_params = {"lookback_bars": 32, "swing_window": 3,
+                        "second_low_tol": 0.005}
         df = load_data(
             start="2020-01-01",
             include_fg=False,
             include_derivatives=False,
             include_cb_premium=False,
             interval="1h",
+            w_bottom_params=w_params,
         )
 
         baseline_results, bh_ret, bh_1y = run_baseline(df)
@@ -1019,6 +1918,11 @@ def main():
             vp_results, bh_ret, bh_1y = run_vp_grid(df)
             all_results.extend(vp_results)
 
+        if wbottom_mode:
+            print("\n===== W-BOTTOM/M-TOP MICROSTRUCTURE GRID =====")
+            wb_results, bh_ret, bh_1y = run_wbottom_grid(df)
+            all_results.extend(wb_results)
+
         if sl_mode:
             print("\n===== STOP-LOSS GRID SWEEP =====")
             sl_results, bh_ret, bh_1y = run_stoploss_grid(df)
@@ -1029,10 +1933,14 @@ def main():
             grid_results, bh_ret, bh_1y = run_grid(df)
             all_results.extend(grid_results)
 
+        if sensitivity_mode:
+            print("\n===== ONE-AT-A-TIME PARAMETER SENSITIVITY =====")
+            bh_ret, bh_1y = run_sensitivity(df)
+
         active = [r for r in all_results if r["trades"] > 0]
         active.sort(key=lambda x: x["sharpe"], reverse=True)
 
-        if grid_mode or sl_mode or filter_mode or velocity_mode or fast_mode or vp_mode:
+        if grid_mode or sl_mode or filter_mode or velocity_mode or fast_mode or vp_mode or wbottom_mode:
             top = active[:30]
             print_results(top, buy_and_hold_ret=bh_ret, buy_and_hold_1y=bh_1y)
 
