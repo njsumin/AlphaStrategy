@@ -8,8 +8,10 @@ Usage:
 ------
     from sr_signals import (
         add_momentum_indicators,
+        add_volume_momentum_indicators,
         MomentumLongCond, MomentumShortCond,
         ReversalLongCond, ReversalShortCond,
+        VolumeReversalLongCond, VolumeReversalShortCond,
         NearResistanceCond, NearSupportCond,
     )
 """
@@ -178,6 +180,8 @@ class ReversalLongCond:
            (filter false reversals where price still falling fast)
         8. min_reward_pct: require dist_to_resistance >= min_reward_pct
            (filter entries with insufficient upside profit space)
+        9. min_w_strength: require w_bottom_strength >= threshold
+           (15m W-bottom microstructure confirmation)
 
     Args:
         proximity_pct: Max distance to support (fraction). Default=0.01.
@@ -193,6 +197,7 @@ class ReversalLongCond:
         sr_count_min: Min S/R cluster count. None=disabled.
         max_abs_velocity: Deprecated, use velocity_floor=-X instead. None=disabled.
         min_reward_pct: Min distance to resistance (fraction). None=disabled.
+        min_w_strength: Min W-bottom strength for 15m confirmation. None=disabled.
     """
     def __init__(self, proximity_pct: float = 0.01, min_decel: float = 0.5,
                  velocity_ceil: float = 0.0, velocity_floor: float = None,
@@ -201,7 +206,8 @@ class ReversalLongCond:
                  fast_velocity_ceil: float = None,
                  fast_velocity_floor: float = None,
                  fast_min_decel: float = None,
-                 min_reward_pct: float = None):
+                 min_reward_pct: float = None,
+                 min_w_strength: float = None):
         self.proximity_pct = proximity_pct
         self.min_decel = min_decel
         self.velocity_ceil = velocity_ceil
@@ -220,6 +226,7 @@ class ReversalLongCond:
         self.fast_velocity_floor = fast_velocity_floor
         self.fast_min_decel = fast_min_decel
         self.min_reward_pct = min_reward_pct
+        self.min_w_strength = min_w_strength
         self.name = (f"RevL(px{proximity_pct*100:.1f}%,"
                      f"dc>{min_decel:.1f})")
 
@@ -269,6 +276,11 @@ class ReversalLongCond:
             # NaN = no resistance found → allow (conservative)
             if not pd.isna(dist_res) and dist_res < self.min_reward_pct:
                 return False
+        # W-bottom microstructure filter (15m)
+        if self.min_w_strength is not None:
+            ws = row.get("w_bottom_strength", 0)
+            if pd.isna(ws) or ws < self.min_w_strength:
+                return False
         return self.name
 
     def __repr__(self):
@@ -316,7 +328,8 @@ class ReversalShortCond:
                  fast_velocity_floor: float = None,
                  fast_velocity_ceil: float = None,
                  fast_min_decel: float = None,
-                 min_reward_pct: float = None):
+                 min_reward_pct: float = None,
+                 min_m_strength: float = None):
         self.proximity_pct = proximity_pct
         self.min_decel = min_decel
         self.velocity_floor = velocity_floor
@@ -335,6 +348,7 @@ class ReversalShortCond:
         self.fast_velocity_ceil = fast_velocity_ceil
         self.fast_min_decel = fast_min_decel
         self.min_reward_pct = min_reward_pct
+        self.min_m_strength = min_m_strength
         self.name = (f"RevS(px{proximity_pct*100:.1f}%,"
                      f"dc>{min_decel:.1f})")
 
@@ -383,6 +397,11 @@ class ReversalShortCond:
             dist_sup = row.get("dist_to_support", np.nan)
             # NaN = no support found → allow (conservative)
             if not pd.isna(dist_sup) and dist_sup < self.min_reward_pct:
+                return False
+        # M-top microstructure filter (15m)
+        if self.min_m_strength is not None:
+            ms = row.get("m_top_strength", 0)
+            if pd.isna(ms) or ms < self.min_m_strength:
                 return False
         return self.name
 
@@ -445,3 +464,396 @@ class NearSupportCond:
 
     def __repr__(self):
         return f"NearSupportCond(proximity_pct={self.proximity_pct})"
+
+
+# ============================================================================
+# VOLUME-CLOCK MOMENTUM INDICATORS
+# ============================================================================
+
+def _compute_vol_lookback(volume_arr: np.ndarray,
+                          target_vol_arr: np.ndarray,
+                          max_lookback: int = 500) -> np.ndarray:
+    """
+    For each bar i, find lookback L such that sum(vol[i-L:i+1]) >= target_vol[i].
+
+    Uses cumulative sum + binary search (vectorized, O(n log n)).
+    Returns array of lookback lengths (integers >= 0).
+
+    Design:
+        c[k] = sum(vol[0:k])  (c[0]=0, c[1]=vol[0], ...)
+        sum(vol[j:i+1]) = c[i+1] - c[j]
+        Want largest j in [max(0, i+1-max_lookback), i] where c[j] <= c[i+1] - tgt
+        → lookback L = i - j
+    """
+    n = len(volume_arr)
+    # Prepend 0 so c[k] = cumulative volume including bars 0..k-1
+    c = np.concatenate([[0.0], np.cumsum(volume_arr.astype(float))])
+
+    # For each bar i: threshold = c[i+1] - target_vol[i]
+    thresholds = c[1:] - np.maximum(0.0, target_vol_arr)
+
+    # searchsorted on sorted c array: find insertion point for each threshold
+    # → position p = first k where c[k] > threshold
+    # → largest j where c[j] <= threshold = p - 1
+    j_indices = np.searchsorted(c, thresholds, side="right") - 1
+
+    # Clamp j to [max(0, i+1-max_lookback), i]
+    i_arr = np.arange(n)
+    j_min = np.maximum(0, i_arr + 1 - max_lookback)
+    j_indices = np.clip(j_indices, j_min, i_arr)
+
+    return i_arr - j_indices  # lookback lengths
+
+
+def add_volume_momentum_indicators(df: pd.DataFrame,
+                                   velocity_vol_mult: float = 8.0,
+                                   fast_vol_mult: float = 2.0,
+                                   atr_period: int = 14,
+                                   vol_ref_period: int = 168,
+                                   max_lookback: int = 500) -> pd.DataFrame:
+    """
+    Add volume-clock momentum indicators for S/R strategy.
+
+    Instead of measuring price change over N fixed time bars, measures over a
+    rolling volume window where cumulative volume reaches
+    velocity_vol_mult × median(volume over vol_ref_period bars).
+
+    This makes the 'clock' tick faster in high-volume periods (e.g., panic
+    selling) and slower in quiet periods, so velocity captures market activity
+    intensity rather than elapsed calendar time.
+
+    Args:
+        df: DataFrame with 'close', 'volume' (and optionally 'high', 'low').
+        velocity_vol_mult: Target volume multiplier for velocity window.
+            e.g. 8.0 ≈ 8× median hourly volume ≈ 8 h at average activity.
+        fast_vol_mult: Target volume multiplier for fast velocity window.
+        atr_period: ATR lookback in bars (time-based, for price normalisation).
+        vol_ref_period: Bars for rolling median volume reference.
+            Default 168 = 1 week of 1 h bars.
+        max_lookback: Maximum bars to search backward for volume accumulation.
+
+    Adds columns:
+        vol_velocity          : price return over vol_window of cumulative volume
+        vol_norm_velocity     : ATR-normalised volume velocity
+        vol_velocity_delta    : change in vol_norm_velocity over velocity lookback
+        fast_vol_velocity     : fast vol-clock velocity
+        fast_vol_norm_velocity: fast vol-clock normalised velocity
+        fast_vol_velocity_delta: fast vol-clock acceleration
+        vol_lookback_bars     : actual time bars in velocity window (diagnostic)
+        volume_ratio          : current volume / rolling mean volume
+    """
+    if "volume" not in df.columns:
+        raise ValueError("add_volume_momentum_indicators requires a 'volume' column")
+
+    close = df["close"].values
+    volume = df["volume"].fillna(0).values
+    n = len(df)
+
+    # ── Reference volume: rolling median over vol_ref_period bars ────────────
+    vol_series = df["volume"].fillna(0)
+    ref_vol = vol_series.rolling(vol_ref_period, min_periods=1).median().values
+
+    target_vol = velocity_vol_mult * ref_vol
+    fast_target_vol = fast_vol_mult * ref_vol
+
+    # ── ATR (time-based, for price-level normalisation) ───────────────────────
+    if "high" in df.columns and "low" in df.columns:
+        high = df["high"].values
+        low = df["low"].values
+        prev_close = np.roll(close, 1)
+        prev_close[0] = close[0]
+        tr = np.maximum(high - low,
+                        np.maximum(np.abs(high - prev_close),
+                                   np.abs(low - prev_close)))
+    else:
+        diffs = np.abs(np.diff(close, prepend=close[0]))
+        tr = diffs
+
+    atr = pd.Series(tr).rolling(atr_period, min_periods=1).mean().values
+    atr_pct = np.where(close > 0, atr / close, 0.0)
+
+    # ── Volume ratio: current bar vs rolling mean ─────────────────────────────
+    vol_mean = vol_series.rolling(atr_period, min_periods=1).mean().values
+    volume_ratio = np.where(vol_mean > 0, volume / vol_mean, 1.0)
+
+    # ── Volume-clock lookbacks ────────────────────────────────────────────────
+    vel_lookbacks = _compute_vol_lookback(volume, target_vol, max_lookback)
+    fast_lookbacks = _compute_vol_lookback(volume, fast_target_vol, max_lookback)
+
+    # ── Volume velocities (price return over volume window) ───────────────────
+    i_arr = np.arange(n)
+    j_arr = np.maximum(0, i_arr - vel_lookbacks)      # starting bars (velocity)
+    fj_arr = np.maximum(0, i_arr - fast_lookbacks)    # starting bars (fast)
+
+    start_close = close[j_arr]
+    vol_velocity = np.where(start_close > 0,
+                            (close - start_close) / start_close, 0.0)
+
+    fstart_close = close[fj_arr]
+    fast_vol_velocity = np.where(fstart_close > 0,
+                                 (close - fstart_close) / fstart_close, 0.0)
+
+    # ── Normalised velocities (divide by ATR%) ────────────────────────────────
+    vol_norm_velocity = np.where(atr_pct > 0, vol_velocity / atr_pct, 0.0)
+    fast_vol_norm_velocity = np.where(atr_pct > 0,
+                                      fast_vol_velocity / atr_pct, 0.0)
+
+    # ── Acceleration: change in norm_velocity over the same volume window ─────
+    # Compare current norm_velocity with the norm_velocity at the start of window
+    vol_velocity_delta = vol_norm_velocity - vol_norm_velocity[j_arr]
+    fast_vol_velocity_delta = (fast_vol_norm_velocity
+                               - fast_vol_norm_velocity[fj_arr])
+
+    # ── Store results ─────────────────────────────────────────────────────────
+    df = df.copy()
+    df["vol_velocity"] = vol_velocity
+    df["vol_norm_velocity"] = vol_norm_velocity
+    df["vol_velocity_delta"] = vol_velocity_delta
+    df["fast_vol_velocity"] = fast_vol_velocity
+    df["fast_vol_norm_velocity"] = fast_vol_norm_velocity
+    df["fast_vol_velocity_delta"] = fast_vol_velocity_delta
+    df["vol_lookback_bars"] = vel_lookbacks
+    df["volume_ratio"] = volume_ratio
+
+    return df
+
+
+# ============================================================================
+# VOLUME-CLOCK ENTRY CONDITIONS
+# ============================================================================
+
+class VolumeReversalLongCond:
+    """
+    Volume-clock mean-reversion long entry near support.
+
+    Mirrors ReversalLongCond but uses vol_norm_velocity / vol_velocity_delta
+    (volume-clock based) instead of time-bar-based norm_velocity / velocity_delta.
+
+    Triggers when:
+        1. dist_to_support < proximity_pct   (price near support)
+        2. vol_norm_velocity < velocity_ceil  (was falling in volume-time)
+        3. vol_velocity_delta > min_decel     (fall decelerating / reversing)
+
+    Optional filters (None = disabled):
+        velocity_floor   : lower bound on vol_norm_velocity
+        fast_velocity_ceil / fast_velocity_floor / fast_min_decel
+            : filters on fast_vol_norm_velocity / fast_vol_velocity_delta
+        min_reward_pct   : minimum dist_to_resistance (profit space)
+        min_vol_ratio    : minimum volume_ratio (confirm with above-avg volume)
+        max_vol_ratio    : maximum volume_ratio (filter extreme spike bars)
+        trend_sma        : require close > sma_{trend_sma}
+        rsi_max          : require rsi_14 < rsi_max
+
+    Args:
+        proximity_pct: Max distance to support (fraction). Default=0.01.
+        min_decel: Min vol_velocity_delta for reversal. Default=0.5.
+        velocity_ceil: Upper bound for vol_norm_velocity. Default=0.
+        velocity_floor: Lower bound for vol_norm_velocity. Default=None.
+        fast_velocity_ceil: Upper bound for fast_vol_norm_velocity. Default=None.
+        fast_velocity_floor: Lower bound for fast_vol_norm_velocity. Default=None.
+        fast_min_decel: Min fast_vol_velocity_delta. Default=None.
+        min_reward_pct: Min dist_to_resistance. Default=None.
+        min_vol_ratio: Min volume_ratio to confirm entry. Default=None.
+        max_vol_ratio: Max volume_ratio to reject spike bars. Default=None.
+        trend_sma: SMA period for trend filter. Default=None.
+        rsi_max: Max RSI-14. Default=None.
+    """
+    def __init__(self, proximity_pct: float = 0.01, min_decel: float = 0.5,
+                 velocity_ceil: float = 0.0, velocity_floor: float = None,
+                 fast_velocity_ceil: float = None,
+                 fast_velocity_floor: float = None,
+                 fast_min_decel: float = None,
+                 min_reward_pct: float = None,
+                 min_vol_ratio: float = None,
+                 max_vol_ratio: float = None,
+                 trend_sma: int = None,
+                 rsi_max: float = None):
+        self.proximity_pct = proximity_pct
+        self.min_decel = min_decel
+        self.velocity_ceil = velocity_ceil
+        self.velocity_floor = velocity_floor
+        self.fast_velocity_ceil = fast_velocity_ceil
+        self.fast_velocity_floor = fast_velocity_floor
+        self.fast_min_decel = fast_min_decel
+        self.min_reward_pct = min_reward_pct
+        self.min_vol_ratio = min_vol_ratio
+        self.max_vol_ratio = max_vol_ratio
+        self.trend_sma = trend_sma
+        self.rsi_max = rsi_max
+        self.name = (f"VolRevL(px{proximity_pct*100:.1f}%,"
+                     f"dc>{min_decel:.1f})")
+
+    def __call__(self, row: pd.Series) -> ConditionResult:
+        dist_sup = row.get("dist_to_support", np.nan)
+        nv = row.get("vol_norm_velocity", np.nan)
+        vd = row.get("vol_velocity_delta", np.nan)
+        if pd.isna(dist_sup) or pd.isna(nv) or pd.isna(vd):
+            return False
+        if not (dist_sup < self.proximity_pct
+                and nv < self.velocity_ceil
+                and vd > self.min_decel):
+            return False
+        # velocity_floor: filter extreme crash bars
+        if self.velocity_floor is not None and nv < self.velocity_floor:
+            return False
+        # Fast velocity filters
+        if self.fast_velocity_ceil is not None:
+            fnv = row.get("fast_vol_norm_velocity", np.nan)
+            if pd.isna(fnv) or fnv > self.fast_velocity_ceil:
+                return False
+        if self.fast_velocity_floor is not None:
+            fnv = row.get("fast_vol_norm_velocity", np.nan)
+            if pd.isna(fnv) or fnv < self.fast_velocity_floor:
+                return False
+        if self.fast_min_decel is not None:
+            fvd = row.get("fast_vol_velocity_delta", np.nan)
+            if pd.isna(fvd) or fvd < self.fast_min_decel:
+                return False
+        # Reward filter: ensure upside to resistance
+        if self.min_reward_pct is not None:
+            dist_res = row.get("dist_to_resistance", np.nan)
+            if not pd.isna(dist_res) and dist_res < self.min_reward_pct:
+                return False
+        # Volume ratio filters
+        if self.min_vol_ratio is not None or self.max_vol_ratio is not None:
+            vr = row.get("volume_ratio", np.nan)
+            if pd.isna(vr):
+                return False
+            if self.min_vol_ratio is not None and vr < self.min_vol_ratio:
+                return False
+            if self.max_vol_ratio is not None and vr > self.max_vol_ratio:
+                return False
+        # Trend filter
+        if self.trend_sma is not None:
+            sma = row.get(f"sma_{self.trend_sma}", np.nan)
+            close = row.get("close", np.nan)
+            if pd.isna(sma) or pd.isna(close) or close <= sma:
+                return False
+        # RSI filter
+        if self.rsi_max is not None:
+            rsi = row.get("rsi_14", np.nan)
+            if pd.isna(rsi) or rsi >= self.rsi_max:
+                return False
+        return self.name
+
+    def __repr__(self):
+        return (f"VolumeReversalLongCond(proximity_pct={self.proximity_pct}, "
+                f"min_decel={self.min_decel})")
+
+
+class VolumeReversalShortCond:
+    """
+    Volume-clock mean-reversion short entry near resistance.
+
+    Mirrors ReversalShortCond but uses vol_norm_velocity / vol_velocity_delta.
+
+    Triggers when:
+        1. dist_to_resistance < proximity_pct  (price near resistance)
+        2. vol_norm_velocity > velocity_floor   (was rising in volume-time)
+        3. vol_velocity_delta < -min_decel      (rise decelerating / reversing)
+
+    Optional filters (None = disabled):
+        velocity_ceil    : upper bound on vol_norm_velocity
+        fast_velocity_ceil / fast_velocity_floor / fast_min_decel
+            : filters on fast_vol_norm_velocity / fast_vol_velocity_delta
+        min_reward_pct   : minimum dist_to_support (profit space)
+        min_vol_ratio    : minimum volume_ratio
+        max_vol_ratio    : maximum volume_ratio
+        trend_sma        : require close < sma_{trend_sma}
+        rsi_min          : require rsi_14 > rsi_min
+
+    Args:
+        proximity_pct: Max distance to resistance (fraction). Default=0.01.
+        min_decel: Min |vol_velocity_delta| for reversal. Default=0.5.
+        velocity_floor: Lower bound for vol_norm_velocity. Default=0.
+        velocity_ceil: Upper bound for vol_norm_velocity. Default=None.
+        fast_velocity_floor: Lower bound for fast_vol_norm_velocity. Default=None.
+        fast_velocity_ceil: Upper bound for fast_vol_norm_velocity. Default=None.
+        fast_min_decel: Min |fast_vol_velocity_delta|. Default=None.
+        min_reward_pct: Min dist_to_support. Default=None.
+        min_vol_ratio: Min volume_ratio. Default=None.
+        max_vol_ratio: Max volume_ratio. Default=None.
+        trend_sma: SMA period for trend filter. Default=None.
+        rsi_min: Min RSI-14. Default=None.
+    """
+    def __init__(self, proximity_pct: float = 0.01, min_decel: float = 0.5,
+                 velocity_floor: float = 0.0, velocity_ceil: float = None,
+                 fast_velocity_floor: float = None,
+                 fast_velocity_ceil: float = None,
+                 fast_min_decel: float = None,
+                 min_reward_pct: float = None,
+                 min_vol_ratio: float = None,
+                 max_vol_ratio: float = None,
+                 trend_sma: int = None,
+                 rsi_min: float = None):
+        self.proximity_pct = proximity_pct
+        self.min_decel = min_decel
+        self.velocity_floor = velocity_floor
+        self.velocity_ceil = velocity_ceil
+        self.fast_velocity_floor = fast_velocity_floor
+        self.fast_velocity_ceil = fast_velocity_ceil
+        self.fast_min_decel = fast_min_decel
+        self.min_reward_pct = min_reward_pct
+        self.min_vol_ratio = min_vol_ratio
+        self.max_vol_ratio = max_vol_ratio
+        self.trend_sma = trend_sma
+        self.rsi_min = rsi_min
+        self.name = (f"VolRevS(px{proximity_pct*100:.1f}%,"
+                     f"dc>{min_decel:.1f})")
+
+    def __call__(self, row: pd.Series) -> ConditionResult:
+        dist_res = row.get("dist_to_resistance", np.nan)
+        nv = row.get("vol_norm_velocity", np.nan)
+        vd = row.get("vol_velocity_delta", np.nan)
+        if pd.isna(dist_res) or pd.isna(nv) or pd.isna(vd):
+            return False
+        if not (dist_res < self.proximity_pct
+                and nv > self.velocity_floor
+                and vd < -self.min_decel):
+            return False
+        # velocity_ceil: filter extreme rally bars
+        if self.velocity_ceil is not None and nv > self.velocity_ceil:
+            return False
+        # Fast velocity filters
+        if self.fast_velocity_floor is not None:
+            fnv = row.get("fast_vol_norm_velocity", np.nan)
+            if pd.isna(fnv) or fnv < self.fast_velocity_floor:
+                return False
+        if self.fast_velocity_ceil is not None:
+            fnv = row.get("fast_vol_norm_velocity", np.nan)
+            if pd.isna(fnv) or fnv > self.fast_velocity_ceil:
+                return False
+        if self.fast_min_decel is not None:
+            fvd = row.get("fast_vol_velocity_delta", np.nan)
+            if pd.isna(fvd) or fvd > -self.fast_min_decel:
+                return False
+        # Reward filter: ensure downside to support
+        if self.min_reward_pct is not None:
+            dist_sup = row.get("dist_to_support", np.nan)
+            if not pd.isna(dist_sup) and dist_sup < self.min_reward_pct:
+                return False
+        # Volume ratio filters
+        if self.min_vol_ratio is not None or self.max_vol_ratio is not None:
+            vr = row.get("volume_ratio", np.nan)
+            if pd.isna(vr):
+                return False
+            if self.min_vol_ratio is not None and vr < self.min_vol_ratio:
+                return False
+            if self.max_vol_ratio is not None and vr > self.max_vol_ratio:
+                return False
+        # Trend filter
+        if self.trend_sma is not None:
+            sma = row.get(f"sma_{self.trend_sma}", np.nan)
+            close = row.get("close", np.nan)
+            if pd.isna(sma) or pd.isna(close) or close >= sma:
+                return False
+        # RSI filter
+        if self.rsi_min is not None:
+            rsi = row.get("rsi_14", np.nan)
+            if pd.isna(rsi) or rsi <= self.rsi_min:
+                return False
+        return self.name
+
+    def __repr__(self):
+        return (f"VolumeReversalShortCond(proximity_pct={self.proximity_pct}, "
+                f"min_decel={self.min_decel})")

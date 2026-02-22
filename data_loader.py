@@ -568,6 +568,8 @@ def _fetch_binance_klines(symbol: str, interval: str,
             all_records.append({
                 "date": pd.Timestamp(row[0], unit="ms"),
                 "open": float(row[1]),
+                "high": float(row[2]),
+                "low": float(row[3]),
                 "close": float(row[4]),
                 "volume": float(row[5]),
             })
@@ -582,7 +584,7 @@ def _fetch_binance_klines(symbol: str, interval: str,
     if all_records:
         print(f"  {len(all_records)} bars downloaded.     ")
     if not all_records:
-        return pd.DataFrame(columns=["date", "open", "close", "volume"])
+        return pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume"])
 
     df = pd.DataFrame(all_records)
     df = df.drop_duplicates(subset="date").sort_values("date").reset_index(drop=True)
@@ -607,6 +609,11 @@ def load_btc_price_15m(start: str = "2018-01-01") -> pd.DataFrame:
     if os.path.exists(_15M_CSV_PATH):
         existing = pd.read_csv(_15M_CSV_PATH)
         existing["date"] = pd.to_datetime(existing["date"])
+        # Migrate old cache without high/low: clear to trigger full re-download
+        if not existing.empty and ("high" not in existing.columns or "low" not in existing.columns):
+            print("  15m cache missing high/low columns, re-downloading...")
+            existing = pd.DataFrame()
+            os.remove(_15M_CSV_PATH)
 
     if not existing.empty:
         fetch_start_ms = int(existing["date"].max().timestamp() * 1000) + 1
@@ -632,7 +639,7 @@ def load_btc_price_15m(start: str = "2018-01-01") -> pd.DataFrame:
         result = existing
 
     if result.empty:
-        return pd.DataFrame(columns=["date", "open", "close", "volume"])
+        return pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume"])
 
     result = result[result["date"] >= start_dt].reset_index(drop=True)
     return result
@@ -661,6 +668,11 @@ def load_btc_price_hourly(start: str = "2018-01-01") -> pd.DataFrame:
     if os.path.exists(_HOURLY_CSV_PATH):
         existing = pd.read_csv(_HOURLY_CSV_PATH)
         existing["date"] = pd.to_datetime(existing["date"])
+        # Migrate old cache without high/low: clear to trigger full re-download
+        if not existing.empty and ("high" not in existing.columns or "low" not in existing.columns):
+            print("  Hourly cache missing high/low columns, re-downloading...")
+            existing = pd.DataFrame()
+            os.remove(_HOURLY_CSV_PATH)
 
     # Determine fetch start
     if not existing.empty:
@@ -688,7 +700,7 @@ def load_btc_price_hourly(start: str = "2018-01-01") -> pd.DataFrame:
         result = existing
 
     if result.empty:
-        return pd.DataFrame(columns=["date", "open", "close", "volume"])
+        return pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume"])
 
     # Filter to requested start date
     result = result[result["date"] >= start_dt].reset_index(drop=True)
@@ -742,6 +754,11 @@ def load_all_data_hourly(start: str = "2018-01-01",
             df["coinbase_premium"] = np.nan
 
     df = df.sort_values("date").reset_index(drop=True)
+    # Drop high/low from hourly output: these are stored in cache for 15m VP
+    # computation but should not change the ATR fallback used by sr_signals
+    for col in ["high", "low"]:
+        if col in df.columns:
+            df = df.drop(columns=[col])
     return df
 
 

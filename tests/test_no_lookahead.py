@@ -208,6 +208,79 @@ def test_backtest_signal_vs_execution():
         return True
 
 
+def test_w_bottom_no_lookahead():
+    """
+    验证 W-bottom/M-top 强度计算不使用未来数据。
+
+    方法：
+    1. 构造合成15m数据，前段低价稳定，后段突然跳到高价
+    2. 用完整数据计算 w_bottom_strength_15m
+    3. 只用跳变前数据重新计算
+    4. 比较跳变前最后一根bar的值——两者必须完全相同
+    """
+    from engine import _compute_w_bottom_m_top
+
+    np.random.seed(42)
+    n_before = 100  # 100 bars @15m before jump
+    n_after = 50    # 50 bars @15m after jump
+
+    # Before: price oscillating 1.10-1.20 (create some swing points)
+    prices_lo_before = np.random.uniform(1.08, 1.18, n_before)
+    prices_hi_before = prices_lo_before + np.random.uniform(0.01, 0.04, n_before)
+    prices_cl_before = (prices_lo_before + prices_hi_before) / 2
+
+    # After: price jumps to 25-30
+    prices_lo_after = np.random.uniform(23, 28, n_after)
+    prices_hi_after = prices_lo_after + np.random.uniform(0.5, 2.0, n_after)
+    prices_cl_after = (prices_lo_after + prices_hi_after) / 2
+
+    dates = pd.date_range("2023-01-01", periods=n_before + n_after, freq="15min")
+
+    df_full = pd.DataFrame({
+        "date": dates,
+        "open": np.concatenate([prices_cl_before, prices_cl_after]),
+        "high": np.concatenate([prices_hi_before, prices_hi_after]),
+        "low": np.concatenate([prices_lo_before, prices_lo_after]),
+        "close": np.concatenate([prices_cl_before, prices_cl_after]),
+        "volume": np.random.uniform(1e4, 5e4, n_before + n_after),
+    })
+
+    # Compute on full data
+    df_full_wm = _compute_w_bottom_m_top(df_full.copy(),
+                                          lookback_bars=32, swing_window=3)
+
+    # Compute on before-only data
+    df_before = df_full.iloc[:n_before].copy()
+    df_before_wm = _compute_w_bottom_m_top(df_before.copy(),
+                                            lookback_bars=32, swing_window=3)
+
+    last_idx = n_before - 1
+    all_pass = True
+
+    for col in ["w_bottom_strength_15m", "m_top_strength_15m"]:
+        val_full = df_full_wm.loc[last_idx, col]
+        val_before = df_before_wm.loc[last_idx, col]
+
+        if pd.isna(val_full) and pd.isna(val_before):
+            print(f"  [PASS] {col}: 均为 NaN")
+            continue
+
+        if pd.isna(val_full) or pd.isna(val_before):
+            print(f"  [FAIL] {col}: full={val_full}, before={val_before}")
+            all_pass = False
+            continue
+
+        if abs(val_full - val_before) > 1e-10:
+            print(f"  [FAIL] {col}: full={val_full:.8f}, before={val_before:.8f}, "
+                  f"diff={val_full - val_before:.2e}")
+            all_pass = False
+        else:
+            print(f"  [PASS] {col}: {val_full:.8f}")
+
+    assert all_pass, "W-bottom/M-top 计算存在未来函数！"
+    print("\n  结论：W-bottom/M-top 强度计算无前瞻偏差")
+
+
 # ============================================================================
 # 综合报告
 # ============================================================================
@@ -221,6 +294,7 @@ def generate_report():
     tests = [
         ("1. 指标计算前瞻偏差检测", test_indicators_no_lookahead),
         ("2. 回测信号日 vs 成交日检测", test_backtest_signal_vs_execution),
+        ("3. W-bottom/M-top 前瞻偏差检测", test_w_bottom_no_lookahead),
     ]
 
     passed = 0

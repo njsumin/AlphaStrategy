@@ -32,6 +32,7 @@ def load_data(start: str = "2018-01-01",
               include_derivatives: bool = True,
               include_cb_premium: bool = False,
               interval: str = "1d",
+              w_bottom_params: dict = None,
               ) -> pd.DataFrame:
     """
     Load all data sources and compute indicators.
@@ -70,6 +71,10 @@ def load_data(start: str = "2018-01-01",
             include_cb_premium=include_cb_premium,
         )
         bars_per_day = 1
+
+    # Store w_bottom_params in attrs before indicator computation
+    if w_bottom_params is not None:
+        df.attrs["w_bottom_params"] = w_bottom_params
 
     # Compute indicators
     df = _add_indicators(df, bars_per_day=bars_per_day)
@@ -140,7 +145,8 @@ def _add_indicators(df: pd.DataFrame, bars_per_day: int = 1) -> pd.DataFrame:
                 df = _add_volume_profile(df, bars_per_day=bpd, window_days=vp_days)
         elif bpd == 24:
             # Use 15-min data for higher-resolution VP, resample back to hourly
-            df = _compute_vp_from_15m(df)
+            w_params = df.attrs.get("w_bottom_params", None)
+            df = _compute_vp_from_15m(df, w_bottom_params=w_params)
         else:
             for vp_days in [3, 7, 14]:
                 df = _add_volume_profile(df, bars_per_day=bpd, window_days=vp_days)
@@ -245,14 +251,188 @@ def _add_volume_profile(df: pd.DataFrame, bars_per_day: int = 24,
     return df
 
 
-def _compute_vp_from_15m(df_hourly: pd.DataFrame) -> pd.DataFrame:
+def _detect_swing_points(lo_series: pd.Series, hi_series: pd.Series,
+                         swing_window: int = 3):
+    """
+    Detect swing lows and swing highs using pure backward rolling (no lookahead).
+
+    swing_low[i] = True when lo_series[i] == min of past (swing_window+1) bars
+    swing_high[i] = True when hi_series[i] == max of past (swing_window+1) bars
+
+    Args:
+        lo_series: Series of low prices.
+        hi_series: Series of high prices.
+        swing_window: Number of confirming bars before current. Default=3 (45min @15m).
+
+    Returns:
+        (swing_low, swing_high) boolean Series.
+    """
+    win = swing_window + 1
+    rolling_min = lo_series.rolling(win, min_periods=win).min()
+    rolling_max = hi_series.rolling(win, min_periods=win).max()
+    swing_low = (lo_series == rolling_min)
+    swing_high = (hi_series == rolling_max)
+    return swing_low, swing_high
+
+
+def _compute_w_bottom_m_top(df_15m: pd.DataFrame,
+                            lookback_bars: int = 32,
+                            swing_window: int = 3,
+                            second_low_tol: float = 0.005) -> pd.DataFrame:
+    """
+    Compute W-bottom and M-top microstructure strength on 15m data.
+
+    W-bottom (long confirmation):
+      In last lookback_bars, find swing_low1 → swing_high1 → swing_low2 → current:
+      - low2 >= low1 * (1 - tolerance)  (double bottom, not lower low)
+      - current_close > low2  (second bounce started)
+      - strength = (current - low2) / (high1 - low2)  (bounce ratio)
+
+    M-top (short confirmation): mirror of W-bottom.
+
+    Output: continuous strength values (max across all valid patterns in window).
+    Zero if no pattern found.
+
+    Args:
+        df_15m: DataFrame with date, open, high, low, close columns.
+        lookback_bars: Number of bars to look back for pattern. Default=32 (8h).
+        swing_window: Swing detection window. Default=3 (45min).
+        second_low_tol: Tolerance for second low being slightly lower. Default=0.005.
+
+    Adds columns: w_bottom_strength_15m, m_top_strength_15m
+    """
+    lo = df_15m["low"].values if "low" in df_15m.columns else df_15m["close"].values
+    hi = df_15m["high"].values if "high" in df_15m.columns else df_15m["close"].values
+    cl = df_15m["close"].values
+    n = len(df_15m)
+
+    # Detect swing points
+    swing_low, swing_high = _detect_swing_points(
+        pd.Series(lo), pd.Series(hi), swing_window)
+    swing_low_arr = swing_low.values
+    swing_high_arr = swing_high.values
+
+    w_strength = np.zeros(n)
+    m_strength = np.zeros(n)
+
+    for i in range(lookback_bars, n):
+        start = i - lookback_bars
+        cur_close = cl[i]
+
+        # --- W-bottom: find low1 → high1 → low2 → current ---
+        best_w = 0.0
+        # Collect swing lows and highs in the lookback window (not including i)
+        s_lows = [j for j in range(start, i) if swing_low_arr[j]]
+        s_highs = [j for j in range(start, i) if swing_high_arr[j]]
+
+        for li1, idx1 in enumerate(s_lows):
+            low1 = lo[idx1]
+            # Find swing highs after idx1
+            for idx_h in s_highs:
+                if idx_h <= idx1:
+                    continue
+                high1 = hi[idx_h]
+                if high1 <= low1:
+                    continue
+                # Between low1 and high1: no lower low, no higher high
+                if idx_h > idx1 + 1:
+                    seg_lo = lo[idx1 + 1:idx_h]
+                    seg_hi = hi[idx1 + 1:idx_h]
+                    if seg_lo.min() < low1:
+                        continue
+                    if seg_hi.max() > high1:
+                        continue
+                # Find swing lows after idx_h
+                for idx2 in s_lows:
+                    if idx2 <= idx_h:
+                        continue
+                    low2 = lo[idx2]
+                    # Double bottom: low2 not significantly lower than low1
+                    if low2 < low1 * (1 - second_low_tol):
+                        continue
+                    # Between high1 and low2: no higher high, no lower low
+                    if idx2 > idx_h + 1:
+                        seg_lo2 = lo[idx_h + 1:idx2]
+                        seg_hi2 = hi[idx_h + 1:idx2]
+                        if seg_hi2.max() > high1:
+                            continue
+                        if seg_lo2.min() < low2:
+                            continue
+                    # Second bounce started
+                    if cur_close <= low2:
+                        continue
+                    # Bounce ratio
+                    denom = high1 - low2
+                    if denom <= 0:
+                        continue
+                    ratio = (cur_close - low2) / denom
+                    if ratio > best_w:
+                        best_w = ratio
+        w_strength[i] = best_w
+
+        # --- M-top: find high1 → low1 → high2 → current (mirror) ---
+        best_m = 0.0
+        for idx1 in s_highs:
+            high1 = hi[idx1]
+            # Find swing lows after idx1
+            for idx_l in s_lows:
+                if idx_l <= idx1:
+                    continue
+                low1 = lo[idx_l]
+                if low1 >= high1:
+                    continue
+                # Between high1 and low1: no higher high, no lower low
+                if idx_l > idx1 + 1:
+                    seg_lo = lo[idx1 + 1:idx_l]
+                    seg_hi = hi[idx1 + 1:idx_l]
+                    if seg_hi.max() > high1:
+                        continue
+                    if seg_lo.min() < low1:
+                        continue
+                # Find swing highs after idx_l
+                for idx2 in s_highs:
+                    if idx2 <= idx_l:
+                        continue
+                    high2 = hi[idx2]
+                    # Double top: high2 not significantly higher than high1
+                    if high2 > high1 * (1 + second_low_tol):
+                        continue
+                    # Between low1 and high2: no lower low, no higher high
+                    if idx2 > idx_l + 1:
+                        seg_lo2 = lo[idx_l + 1:idx2]
+                        seg_hi2 = hi[idx_l + 1:idx2]
+                        if seg_lo2.min() < low1:
+                            continue
+                        if seg_hi2.max() > high2:
+                            continue
+                    # Second drop started
+                    if cur_close >= high2:
+                        continue
+                    # Drop ratio
+                    denom = high2 - low1
+                    if denom <= 0:
+                        continue
+                    ratio = (high2 - cur_close) / denom
+                    if ratio > best_m:
+                        best_m = ratio
+        m_strength[i] = best_m
+
+    df_15m["w_bottom_strength_15m"] = w_strength
+    df_15m["m_top_strength_15m"] = m_strength
+    return df_15m
+
+
+def _compute_vp_from_15m(df_hourly: pd.DataFrame,
+                         w_bottom_params: dict = None) -> pd.DataFrame:
     """
     Compute VP indicators from 15-min data and merge into hourly DataFrame.
+    Optionally compute W-bottom/M-top microstructure strength.
 
     1. Load 15-min OHLCV data
     2. Compute VP (POC/VAH/VAL) on 15-min bars (bars_per_day=96)
-    3. Resample to hourly (take last 15-min bar per hour)
-    4. Merge VP columns into df_hourly
+    3. Optionally compute W-bottom/M-top strength on 15-min bars
+    4. Resample to hourly (take last 15-min bar per hour for VP, max per hour for W/M)
+    5. Merge VP + W/M columns into df_hourly
     """
     start_date = df_hourly["date"].min().strftime("%Y-%m-%d")
     df_15m = load_btc_price_15m(start=start_date)
@@ -271,16 +451,38 @@ def _compute_vp_from_15m(df_hourly: pd.DataFrame) -> pd.DataFrame:
         df_15m = _add_volume_profile(
             df_15m, bars_per_day=96, window_days=vp_days)
 
-    # Resample to hourly: take last 15-min bar per hour
+    # Compute W-bottom / M-top if requested
+    wm_cols = []
+    if w_bottom_params is not None:
+        print(f"Computing W-bottom/M-top from 15m data...")
+        df_15m = _compute_w_bottom_m_top(df_15m, **w_bottom_params)
+        wm_cols = ["w_bottom_strength_15m", "m_top_strength_15m"]
+
+    # Resample to hourly: take last 15-min bar per hour for VP
     vp_cols = [c for c in df_15m.columns if c.startswith("vp_")]
     df_15m["hour"] = df_15m["date"].dt.floor("h")
     vp_hourly = df_15m.groupby("hour")[vp_cols].last().reset_index()
     vp_hourly = vp_hourly.rename(columns={"hour": "date"})
 
+    # For W/M strength: take max per hour (strongest pattern within the hour)
+    if wm_cols:
+        wm_hourly = df_15m.groupby("hour")[wm_cols].max().reset_index()
+        wm_hourly = wm_hourly.rename(columns={
+            "hour": "date",
+            "w_bottom_strength_15m": "w_bottom_strength",
+            "m_top_strength_15m": "m_top_strength",
+        })
+        vp_hourly = vp_hourly.merge(wm_hourly, on="date", how="left")
+
     # Drop existing VP columns from hourly df if any
     existing_vp = [c for c in df_hourly.columns if c.startswith("vp_")]
     if existing_vp:
         df_hourly = df_hourly.drop(columns=existing_vp)
+
+    # Drop existing W/M columns from hourly df if any
+    for col in ["w_bottom_strength", "m_top_strength"]:
+        if col in df_hourly.columns:
+            df_hourly = df_hourly.drop(columns=[col])
 
     # Merge
     df_hourly = df_hourly.merge(vp_hourly, on="date", how="left")
