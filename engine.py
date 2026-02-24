@@ -510,6 +510,7 @@ def backtest(df: pd.DataFrame,
              short_cond=None,
              cover_cond=None,
              close_conditions: Optional[list] = None,
+             short_close_conditions: Optional[list] = None,
              source_aware_sell: bool = False,
              sell_map: Optional[dict] = None,
              initial_capital: float = 10000.0,
@@ -527,6 +528,9 @@ def backtest(df: pd.DataFrame,
         cover_cond: Optional cover condition (row -> str/True/False). Required if short_cond set.
         close_conditions: Optional list of close condition objects (StopLoss, TakeProfit, etc.)
             These are checked every bar when in position. Each must have a check() method.
+            Applied to long positions. Also used for shorts if short_close_conditions is None.
+        short_close_conditions: Optional list of close conditions for short positions only.
+            If None, falls back to close_conditions. Use SRStopLossShort here for correct S/R stops.
         source_aware_sell: If True, uses sell_map to route exits by entry source.
         sell_map: Dict mapping entry source label -> sell condition function.
             Example: {"FG<10+RSI<35": fg_rsi_sell, "Fund<-0.01%": funding_sell}
@@ -559,7 +563,8 @@ def backtest(df: pd.DataFrame,
     entry_price = 0.0
     entry_date = None
     entry_source = None
-    peak_price = 0.0
+    peak_price = 0.0       # long: max close since entry
+    short_floor_price = 0.0  # short: min close since entry (for reflected peak)
 
     # Pending signal from previous day (T-day signal -> T+1 execution)
     pending_buy = None    # str source label, or None
@@ -604,6 +609,7 @@ def backtest(df: pd.DataFrame,
             entry_price = exec_price
             entry_date = date
             entry_source = pending_short
+            short_floor_price = exec_price
             pending_short = None
 
         elif pending_cover and position == -1:
@@ -662,6 +668,8 @@ def backtest(df: pd.DataFrame,
                             r = cc.check(close, entry_price, row)
                         elif 'days_held' in params:
                             r = cc.check(close, entry_price, days_held)
+                        elif 'peak_price' in params and 'entry_price' in params:
+                            r = cc.check(close, entry_price, peak_price)
                         elif 'peak_price' in params:
                             r = cc.check(close, peak_price)
                         else:
@@ -675,6 +683,7 @@ def backtest(df: pd.DataFrame,
                 pending_sell = sell_source
 
         elif position == -1:
+            short_floor_price = min(short_floor_price, close)
             should_cover = False
             cover_source = ""
 
@@ -685,11 +694,16 @@ def backtest(df: pd.DataFrame,
                     cover_source = s if isinstance(s, str) else "COVER"
 
             # Check close conditions for short positions (stop-loss etc.)
-            if not should_cover and close_conditions:
-                # For short: loss when price rises above entry
+            _short_cc = short_close_conditions if short_close_conditions is not None else close_conditions
+            if not should_cover and _short_cc:
+                # For short: loss when price rises above entry.
+                # Reflected price: short_pnl_price = entry*(2 - close/entry)
+                # Reflected peak:  short_pnl_peak  = entry*(2 - floor/entry)
+                #   when floor is lowest close, reflected peak is highest pnl point.
                 short_pnl_price = entry_price * (2 - close / entry_price)
+                short_pnl_peak  = entry_price * (2 - short_floor_price / entry_price)
                 days_held = (date - entry_date).total_seconds() / 86400 if entry_date else 0
-                for cc in close_conditions:
+                for cc in _short_cc:
                     if hasattr(cc, 'check'):
                         import inspect
                         sig = inspect.signature(cc.check)
@@ -698,8 +712,10 @@ def backtest(df: pd.DataFrame,
                             r = cc.check(short_pnl_price, entry_price, row)
                         elif 'days_held' in params:
                             r = cc.check(short_pnl_price, entry_price, days_held)
+                        elif 'peak_price' in params and 'entry_price' in params:
+                            r = cc.check(short_pnl_price, entry_price, short_pnl_peak)
                         elif 'peak_price' in params:
-                            r = False  # trailing stop not applicable for shorts
+                            r = cc.check(short_pnl_price, short_pnl_peak)
                         else:
                             r = cc.check(short_pnl_price, entry_price)
                         if r:

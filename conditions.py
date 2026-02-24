@@ -631,6 +631,58 @@ class TrailingStopCond:
         return f"TrailingStopCond(threshold={self.threshold})"
 
 
+class RatchetStopCond:
+    """
+    Two-phase stop that ratchets up as trade becomes profitable.
+
+    Phase 1 — before activation (peak gain < activate_pct):
+        Hard stop at hard_sl from entry price.
+    Phase 2 — after activation (peak gain >= activate_pct):
+        Trail from peak by trail_pct, locking in profits.
+
+    This minimises per-trade losses while letting winners run:
+    - Bad trades stopped quickly at hard_sl (e.g. -1.5%)
+    - Good trades protected via trailing stop from their best point
+
+    Args:
+        hard_sl     (float): Hard stop before activation, e.g. -0.015 (-1.5%).
+        activate_pct(float): Peak gain needed to switch to trailing, e.g. 0.005 (+0.5%).
+        trail_pct   (float): Trail distance from peak, e.g. 0.03 (3%).
+
+    Required: peak_price tracked by the engine (both long and short via reflected peak).
+
+    Example (long, entry=100):
+        Peak rises to 100.5 (+0.5%) → activates trailing
+        Peak rises to 103 → SL locks at 103*(1-0.03) = 99.9 (near break-even)
+        Peak rises to 106 → SL locks at 106*(1-0.03) = 102.8 (+2.8% protected)
+    """
+    def __init__(self, hard_sl: float = -0.015,
+                 activate_pct: float = 0.005,
+                 trail_pct: float = 0.03):
+        self.hard_sl      = hard_sl
+        self.activate_pct = activate_pct
+        self.trail_pct    = trail_pct
+        self.name = (f"Ratchet(sl{hard_sl*100:.1f}%"
+                     f"_act{activate_pct*100:.1f}%"
+                     f"_tr{trail_pct*100:.0f}%)")
+
+    def check(self, current_price: float, entry_price: float,
+              peak_price: float) -> ConditionResult:
+        max_gain = (peak_price - entry_price) / entry_price
+        if max_gain < self.activate_pct:
+            # Phase 1: hard stop
+            pnl = (current_price - entry_price) / entry_price
+            return self.name if pnl < self.hard_sl else False
+        else:
+            # Phase 2: trail from peak
+            drop = (current_price - peak_price) / peak_price
+            return self.name if drop < -self.trail_pct else False
+
+    def __repr__(self):
+        return (f"RatchetStopCond(hard_sl={self.hard_sl}, "
+                f"activate_pct={self.activate_pct}, trail_pct={self.trail_pct})")
+
+
 class SRStopLossLong:
     """
     S/R dynamic stop-loss for LONG positions.

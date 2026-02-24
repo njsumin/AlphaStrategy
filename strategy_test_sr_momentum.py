@@ -45,7 +45,8 @@ import sys
 import numpy as np
 import pandas as pd
 from conditions import (
-    StopLossCond, combine_conditions,
+    StopLossCond, TakeProfitCond, TrailingStopCond, RatchetStopCond,
+    combine_conditions,
     SRStopLossLong, SRStopLossShort, ATRStopLossCond, TimeBarStopCond,
 )
 from engine import load_data, backtest, print_results, save_results_to_files
@@ -56,6 +57,10 @@ from sr_signals import (
     ReversalLongCond, ReversalShortCond,
     VolumeReversalLongCond, VolumeReversalShortCond,
     NearResistanceCond, NearSupportCond,
+)
+from trend_regime import (
+    compute_regime, map_regime_to_bars, resample_to_daily,
+    RegimeLongCond, RegimeShortCond,
 )
 
 
@@ -1090,6 +1095,281 @@ def run_vp_grid(df):
     return all_results, bh_ret, bh_1y
 
 
+def run_sl_optimization(df):
+    """
+    Walk-forward stop-loss optimization for 1h Baseline_D.
+
+    固定入场参数（baseline: prox=0.5%, decel=1.5, vb=8, vc=0.5）
+    只在止损机制上做网格搜索，walk-forward验证防止过拟合。
+
+    Train: 2021-01-01 ~ 2025-05-31
+    Val  : 2025-06-01 ~ present
+
+    网格维度：
+      Phase A - fixed_sl  : 无 / -1% / -1.5% / -2% / -3% / -4% / -5%  × time_stop
+      Phase B - sr_sl     : SR(buffer, max_loss) 多个组合  × time_stop（多空分离）
+      Phase C - atr_sl    : ATR(1.5x/2x/3x)  × time_stop
+      Phase D - trailing  : Trail(3/5/8/10%)  × T24h/noT（多头追踪，空头等幅固定）
+      Phase E - tp+sl     : TP(1.5/2/3/5%) + SL4%  × T24h/noT
+      time_stop : 无 / 24h / 48h / 72h / 96h
+
+    对每个组合统计：收益/夏普/最大回撤/止损触发率(SL%)
+    """
+    TRAIN_START = "2021-01-01"
+    TRAIN_END   = "2025-05-31"
+    VAL_START   = "2025-06-01"
+
+    b    = BASELINE
+    prox   = b["proximity_pct"]
+    decel  = b["min_decel"]
+    v_ceil = b["velocity_ceil_long"]
+    v_floor= b["velocity_floor_short"]
+
+    print("  Building S/R + momentum dataset...", flush=True)
+    df_slim = _prepare_data(df, b["cluster_gap_pct"], b["velocity_bars"])
+
+    df_train = df_slim[df_slim["date"] <= TRAIN_END].reset_index(drop=True)
+    df_train.attrs = df_slim.attrs.copy()
+    df_val   = df_slim[df_slim["date"] >= VAL_START].reset_index(drop=True)
+    df_val.attrs = df_slim.attrs.copy()
+
+    bh_train = (df_train["close"].iloc[-1] / df_train["close"].iloc[0] - 1) * 100
+    bh_val   = (df_val["close"].iloc[-1]   / df_val["close"].iloc[0]   - 1) * 100
+
+    buy_cond   = ReversalLongCond(prox, decel, velocity_ceil=v_ceil)
+    short_cond = ReversalShortCond(prox, decel, velocity_floor=v_floor)
+    sell_cond  = NearResistanceCond(0.002)
+    cover_cond = NearSupportCond(0.002)
+
+    # ── 止损配置网格 ──────────────────────────────────────────────────────────
+    # 每个 config: (name, long_sl_list, short_sl_list)
+    sl_configs = []
+
+    fixed_sls   = [None, -0.010, -0.015, -0.020, -0.030, -0.040, -0.050]
+    time_stops  = [None, 24, 48, 72, 96]
+    sr_configs  = [
+        None,
+        (0.002, 0.02),   # buffer=0.2%, max=2%
+        (0.003, 0.03),   # buffer=0.3%, max=3%
+        (0.005, 0.04),   # buffer=0.5%, max=4%
+    ]
+    atr_mults   = [None, 1.5, 2.0, 3.0]
+    trail_pcts  = [0.03, 0.05, 0.08, 0.10]   # Phase D: trailing stop thresholds
+    tp_pcts     = [0.015, 0.02, 0.03, 0.05]  # Phase E: take-profit targets
+
+    # Phase A: fixed SL × time stop  (no SR/ATR)
+    for fsl in fixed_sls:
+        for ts in time_stops:
+            long_conds  = []
+            short_conds = []
+            if fsl is not None:
+                long_conds.append(StopLossCond(fsl))
+                short_conds.append(StopLossCond(fsl))
+            if ts is not None:
+                long_conds.append(TimeBarStopCond(ts))
+                short_conds.append(TimeBarStopCond(ts))
+            fsl_str = f"SL{abs(fsl)*100:.0f}%" if fsl else "noSL"
+            ts_str  = f"T{ts}h" if ts else "noT"
+            sl_configs.append((f"{fsl_str}+{ts_str}", long_conds, short_conds))
+
+    # Phase B: SR stop × time stop  (long/short分离，修复空头SR止损)
+    for sr in sr_configs[1:]:   # skip None
+        for ts in time_stops:
+            buf, mx = sr
+            long_conds  = [SRStopLossLong(buf, mx)]
+            short_conds = [SRStopLossShort(buf, mx)]
+            if ts is not None:
+                long_conds.append(TimeBarStopCond(ts))
+                short_conds.append(TimeBarStopCond(ts))
+            sr_str = f"SR(b{buf*1000:.0f}_x{mx*100:.0f}%)"
+            ts_str = f"T{ts}h" if ts else "noT"
+            sl_configs.append((f"{sr_str}+{ts_str}", long_conds, short_conds))
+
+    # Phase C: ATR stop × time stop  (no fixed SL)
+    for atr in atr_mults[1:]:
+        for ts in time_stops:
+            long_conds  = [ATRStopLossCond(atr)]
+            short_conds = [ATRStopLossCond(atr)]
+            if ts is not None:
+                long_conds.append(TimeBarStopCond(ts))
+                short_conds.append(TimeBarStopCond(ts))
+            atr_str = f"ATR{atr:.1f}x"
+            ts_str  = f"T{ts}h" if ts else "noT"
+            sl_configs.append((f"{atr_str}+{ts_str}", long_conds, short_conds))
+
+    # Phase D: 追踪止损 × T24h/noT（仅多头有效，空头引擎返回False）
+    for tr in trail_pcts:
+        for ts in [None, 24]:
+            long_conds  = [TrailingStopCond(-tr)]
+            short_conds = [StopLossCond(-tr)]   # 空头用等幅固定止损替代
+            if ts is not None:
+                long_conds.append(TimeBarStopCond(ts))
+                short_conds.append(TimeBarStopCond(ts))
+            tr_str = f"Trail{tr*100:.0f}%"
+            ts_str = f"T{ts}h" if ts else "noT"
+            sl_configs.append((f"{tr_str}+{ts_str}", long_conds, short_conds))
+
+    # Phase E: 止盈 + SL4% + T24h/noT 组合
+    best_sl = -0.04   # 依据Phase A最优
+    for tp in tp_pcts:
+        for ts in [None, 24]:
+            long_conds  = [TakeProfitCond(tp), StopLossCond(best_sl)]
+            short_conds = [TakeProfitCond(tp), StopLossCond(best_sl)]
+            if ts is not None:
+                long_conds.append(TimeBarStopCond(ts))
+                short_conds.append(TimeBarStopCond(ts))
+            tp_str = f"TP{tp*100:.1f}%+SL4%"
+            ts_str = f"T{ts}h" if ts else "noT"
+            sl_configs.append((f"{tp_str}+{ts_str}", long_conds, short_conds))
+
+    # Phase F: 棘轮止损（两阶段：初始硬止损 + 激活后追踪）
+    # 目标：减少每笔损失幅度，同时不截断赢家
+    # hard_sl × activate_pct × trail_pct × T24h/noT
+    ratchet_params = [
+        (-0.010, 0.005, 0.025),  # SL1%，激活+0.5%，追踪2.5%
+        (-0.015, 0.005, 0.030),  # SL1.5%，激活+0.5%，追踪3%
+        (-0.015, 0.010, 0.030),  # SL1.5%，激活+1%，追踪3%
+        (-0.020, 0.005, 0.030),  # SL2%，激活+0.5%，追踪3%
+        (-0.020, 0.010, 0.040),  # SL2%，激活+1%，追踪4%
+        (-0.025, 0.005, 0.040),  # SL2.5%，激活+0.5%，追踪4%
+        (-0.030, 0.005, 0.040),  # SL3%，激活+0.5%，追踪4%
+        (-0.030, 0.010, 0.040),  # SL3%，激活+1%，追踪4%
+    ]
+    for hsl, act, tr in ratchet_params:
+        for ts in [None, 24]:
+            rc = RatchetStopCond(hard_sl=hsl, activate_pct=act, trail_pct=tr)
+            long_conds  = [rc]
+            short_conds = [rc]
+            if ts is not None:
+                long_conds  = [rc, TimeBarStopCond(ts)]
+                short_conds = [rc, TimeBarStopCond(ts)]
+            name = (f"Ratchet(sl{abs(hsl)*100:.0f}%"
+                    f"_a{act*100:.1f}%_tr{tr*100:.0f}%)+{('T24h' if ts else 'noT')}")
+            sl_configs.append((name, long_conds, short_conds))
+
+    total = len(sl_configs)
+    print(f"  Phase 1: {total} Dual combos  train {TRAIN_START}~{TRAIN_END}"
+          f"  /  val {VAL_START}~present", flush=True)
+    print(f"  BH train={bh_train:+.1f}%  val={bh_val:+.1f}%")
+
+    def _sl_rate(result):
+        """止损触发率 = SL类型退出 / 总退出次数（source字段）"""
+        trades = result.get("trade_log", [])
+        exits  = [t for t in trades if t["type"] in ("SELL", "COVER")]
+        if not exits:
+            return 0.0
+        sl_exits = [t for t in exits
+                    if any(kw in str(t.get("source", ""))
+                           for kw in ("SL", "ATR", "SR_SL", "Time"))]
+        return len(sl_exits) / len(exits)
+
+    # ── 训练集扫描 ────────────────────────────────────────────────────────────
+    train_results = []
+    for i, (name, long_sl, short_sl) in enumerate(sl_configs, 1):
+        res = backtest(
+            df_train, f"D_{name}",
+            buy_cond=buy_cond,   sell_cond=sell_cond,
+            short_cond=short_cond, cover_cond=cover_cond,
+            close_conditions=long_sl or None,
+            short_close_conditions=short_sl or None,
+        )
+        train_results.append((name, long_sl, short_sl, res))
+        if i % max(1, total // 5) == 0 or i == total:
+            print(f"  Phase 1: {i}/{total}", flush=True)
+
+    # 按训练夏普排序，取 top-20
+    train_results.sort(key=lambda x: x[3]["sharpe"], reverse=True)
+    top20 = train_results[:20]
+
+    # ── 验证集 ────────────────────────────────────────────────────────────────
+    print(f"\n  Phase 2: validating top-20 configs...", flush=True)
+    val_results = []
+    for name, long_sl, short_sl, res_t in top20:
+        res_v = backtest(
+            df_val, f"D_{name}",
+            buy_cond=buy_cond,   sell_cond=sell_cond,
+            short_cond=short_cond, cover_cond=cover_cond,
+            close_conditions=long_sl or None,
+            short_close_conditions=short_sl or None,
+        )
+        val_results.append((name, res_t, res_v))
+
+    # ── 打印结果表 ────────────────────────────────────────────────────────────
+    hdr = (f"\n{'':=<130}\n"
+           f"  SL Optimization — Top-20 by Train Sharpe (validated)"
+           f"   BH train={bh_train:+.1f}%  val={bh_val:+.1f}%\n"
+           f"{'':=<130}")
+    print(hdr)
+    col = (f"  {'config':<28} "
+           f"{'TrRet':>7} {'TrShr':>6} {'TrMDD':>7} {'TrN':>5} {'TrSL%':>6}  "
+           f"{'VaRet':>7} {'VaShr':>6} {'VaMDD':>7} {'VaN':>5} {'VaSL%':>6}")
+    print(col)
+    print(f"  {'-'*128}")
+
+    for name, res_t, res_v in val_results:
+        sl_t = _sl_rate(res_t) * 100
+        sl_v = _sl_rate(res_v) * 100
+        star = "*" if res_v["sharpe"] > res_t["sharpe"] * 0.7 else " "
+        print(
+            f"  {star} {name:<28} "
+            f"{res_t['total_return']:>7.1f}% {res_t['sharpe']:>6.3f} "
+            f"{res_t['max_drawdown']:>7.1f}% {res_t['trades']:>5} {sl_t:>5.1f}%  "
+            f"{res_v['total_return']:>7.1f}% {res_v['sharpe']:>6.3f} "
+            f"{res_v['max_drawdown']:>7.1f}% {res_v['trades']:>5} {sl_v:>5.1f}%"
+        )
+
+    # val Sharpe 排序
+    val_results_sorted = sorted(val_results, key=lambda x: x[2]["sharpe"], reverse=True)
+    print(f"\n{'':=<130}")
+    print(f"  SL Optimization — Same configs sorted by Val Sharpe")
+    print(f"{'':=<130}")
+    print(col)
+    print(f"  {'-'*128}")
+    for name, res_t, res_v in val_results_sorted:
+        sl_t = _sl_rate(res_t) * 100
+        sl_v = _sl_rate(res_v) * 100
+        star = "*" if res_v["sharpe"] > res_t["sharpe"] * 0.7 else " "
+        print(
+            f"  {star} {name:<28} "
+            f"{res_t['total_return']:>7.1f}% {res_t['sharpe']:>6.3f} "
+            f"{res_t['max_drawdown']:>7.1f}% {res_t['trades']:>5} {sl_t:>5.1f}%  "
+            f"{res_v['total_return']:>7.1f}% {res_v['sharpe']:>6.3f} "
+            f"{res_v['max_drawdown']:>7.1f}% {res_v['trades']:>5} {sl_v:>5.1f}%"
+        )
+
+    # ── 最优配置年度明细 ──────────────────────────────────────────────────────
+    best_name, best_res_t, best_res_v = val_results_sorted[0]
+    # 在全集上重跑最优配置
+    best_cfg = next((x for x in sl_configs if x[0] == best_name), None)
+    if best_cfg:
+        _, long_sl, _ = best_cfg
+        res_full = backtest(
+            df_slim, f"BestSL_{best_name}",
+            buy_cond=buy_cond,   sell_cond=sell_cond,
+            short_cond=short_cond, cover_cond=cover_cond,
+            close_conditions=long_sl,
+        )
+        print(f"\n  Best Val config: {best_name}")
+        print(f"  Full period: {res_full['total_return']:.1f}%  "
+              f"Sharpe={res_full['sharpe']:.3f}  MaxDD={res_full['max_drawdown']:.1f}%  "
+              f"Trades={res_full['trades']}")
+        print_yearly_breakdown(res_full, bars_per_day=24)
+
+    # 与原 baseline 对比
+    print(f"\n  --- Baseline_D reference ---")
+    ref = backtest(
+        df_slim, "Baseline_D_ref",
+        buy_cond=buy_cond,   sell_cond=sell_cond,
+        short_cond=short_cond, cover_cond=cover_cond,
+        close_conditions=BASELINE_SL,
+    )
+    sl_ref = _sl_rate(ref) * 100
+    print(f"  Full period: {ref['total_return']:.1f}%  "
+          f"Sharpe={ref['sharpe']:.3f}  MaxDD={ref['max_drawdown']:.1f}%  "
+          f"Trades={ref['trades']}  SL%={sl_ref:.1f}%")
+    print_yearly_breakdown(ref, bars_per_day=24)
+
+
 def run_stoploss_grid(df):
     """Run stop-loss mechanism grid search with fixed baseline entry parameters."""
     b = BASELINE
@@ -1522,6 +1802,396 @@ TRAIN_END_VOL   = "2025-05-31"
 VAL_START_VOL   = "2025-06-01"
 
 
+# ============================================================================
+# TREND REGIME BASELINE (conditional long/short switching)
+# ============================================================================
+
+REGIME_METHODS = {
+    "supertrend": {"period": 10, "multiplier": 3.0},
+    # Add more methods here as needed
+}
+
+
+def run_regime_baseline(df, method: str = "supertrend", **regime_kwargs):
+    """
+    Run S/R Baseline (1h) with daily trend regime gating.
+
+    Long entries  → only when daily regime == +1 (bull)
+    Short entries → only when daily regime == -1 (bear)
+
+    Regime computed from daily OHLCV resampled from the 1h data.
+    shift_days=1: no lookahead (yesterday's close → today's entries).
+
+    Prints comparison:
+      - Baseline_D       (original, unrestricted)
+      - Regime_{method}_D (regime-gated dual)
+      - Regime_{method}_L (regime-gated long)
+      - Regime_{method}_S (regime-gated short)
+
+    Args:
+        df     : 1h DataFrame from load_data(interval='1h').
+        method : Regime method ('supertrend', 'ma200', 'ma_cross', 'momentum').
+    """
+    defaults = REGIME_METHODS.get(method, {})
+    params   = {**defaults, **regime_kwargs}
+
+    b       = BASELINE
+    df_slim = _prepare_data(df, b["cluster_gap_pct"], b["velocity_bars"])
+    bh_ret, bh_1y = _compute_bh(df_slim)
+
+    # Compute daily regime from resampled 1h data
+    daily_ohlcv   = resample_to_daily(df_slim, date_col="date")
+    regime_series = compute_regime(daily_ohlcv, method=method, **params)
+    regime_arr    = map_regime_to_bars(regime_series, df_slim,
+                                       date_col="date", shift_days=1)
+    df_slim = df_slim.copy()
+    df_slim["regime"] = regime_arr
+
+    bull_pct = (regime_arr == 1).mean() * 100
+    bear_pct = (regime_arr == -1).mean() * 100
+    print(f"  Regime ({method} {params}): "
+          f"bull={bull_pct:.1f}%  bear={bear_pct:.1f}%")
+
+    prox    = b["proximity_pct"]
+    decel   = b["min_decel"]
+    v_ceil  = b["velocity_ceil_long"]
+    v_floor = b["velocity_floor_short"]
+    sl      = BASELINE_SL
+
+    results = []
+
+    # Original baseline (no regime filter)
+    results.append(backtest(
+        df_slim, "Baseline_D",
+        buy_cond=ReversalLongCond(prox, decel, velocity_ceil=v_ceil),
+        sell_cond=NearResistanceCond(0.002),
+        short_cond=ReversalShortCond(prox, decel, velocity_floor=v_floor),
+        cover_cond=NearSupportCond(0.002),
+        close_conditions=sl,
+    ))
+
+    # Regime-gated Dual
+    results.append(backtest(
+        df_slim, f"Regime_{method}_D",
+        buy_cond=RegimeLongCond(
+            ReversalLongCond(prox, decel, velocity_ceil=v_ceil)),
+        sell_cond=NearResistanceCond(0.002),
+        short_cond=RegimeShortCond(
+            ReversalShortCond(prox, decel, velocity_floor=v_floor)),
+        cover_cond=NearSupportCond(0.002),
+        close_conditions=sl,
+    ))
+
+    # Regime-gated Long only
+    results.append(backtest(
+        df_slim, f"Regime_{method}_L",
+        buy_cond=RegimeLongCond(
+            ReversalLongCond(prox, decel, velocity_ceil=v_ceil)),
+        sell_cond=NearResistanceCond(0.002),
+        close_conditions=sl,
+    ))
+
+    # Regime-gated Short only
+    results.append(backtest(
+        df_slim, f"Regime_{method}_S",
+        buy_cond=lambda row: False,
+        sell_cond=lambda row: False,
+        short_cond=RegimeShortCond(
+            ReversalShortCond(prox, decel, velocity_floor=v_floor)),
+        cover_cond=NearSupportCond(0.002),
+        close_conditions=sl,
+    ))
+
+    return results, bh_ret, bh_1y
+
+
+def run_regime_baseline_15m(df, method: str = "supertrend", **regime_kwargs):
+    """
+    Run S/R Baseline_15m with daily trend regime gating.
+
+    Long entries  → only when daily regime == +1 (bull)
+    Short entries → only when daily regime == -1 (bear)
+
+    Regime is computed from daily OHLCV resampled from the 15m data.
+    Uses shift_days=1: today's bars see yesterday's daily close regime
+    (no lookahead across day boundary).
+
+    Prints comparison table:
+      - Original Baseline_15m_D   (unrestricted dual)
+      - Regime_15m_D              (regime-gated dual)
+      - Regime_15m_L only
+      - Regime_15m_S only
+
+    Args:
+        df         : 15m DataFrame from load_data(interval='15m').
+        method     : Regime method ('supertrend', 'ma200', 'ma_cross', 'momentum').
+        **regime_kwargs: Override default params for the chosen method.
+    """
+    defaults = REGIME_METHODS.get(method, {})
+    params   = {**defaults, **regime_kwargs}
+
+    b       = BASELINE_15M
+    df_slim = _prepare_data(
+        df,
+        b["cluster_gap_pct"],
+        b["velocity_bars"],
+        backtest_start="2021-01-01",
+        vp_windows=b.get("vp_windows"),
+        fast_velocity_bars=b["fast_velocity_bars"],
+    )
+    bh_ret, bh_1y = _compute_bh(df_slim)
+
+    # ── Compute daily regime from resampled 15m data ─────────────────────────
+    daily_ohlcv = resample_to_daily(df_slim, date_col="date")
+    regime_series = compute_regime(daily_ohlcv, method=method, **params)
+
+    # shift_days=1: no lookahead (yesterday's daily close → today's bars)
+    regime_arr = map_regime_to_bars(regime_series, df_slim,
+                                    date_col="date", shift_days=1)
+    df_slim = df_slim.copy()
+    df_slim["regime"] = regime_arr
+
+    # Report regime distribution
+    bull_pct = (regime_arr == 1).mean() * 100
+    bear_pct = (regime_arr == -1).mean() * 100
+    print(f"  Regime ({method} {params}): "
+          f"bull={bull_pct:.1f}%  bear={bear_pct:.1f}%")
+
+    prox    = b["proximity_pct"]
+    decel   = b["min_decel"]
+    v_ceil  = b["velocity_ceil_long"]
+    v_floor = b["velocity_floor_short"]
+    sl      = BASELINE_15M_SL
+
+    results = []
+
+    # Original baseline (no regime filter) for comparison
+    results.append(backtest(
+        df_slim, "Baseline_15m_D",
+        buy_cond=ReversalLongCond(prox, decel, velocity_ceil=v_ceil),
+        sell_cond=NearResistanceCond(0.002),
+        short_cond=ReversalShortCond(prox, decel, velocity_floor=v_floor),
+        cover_cond=NearSupportCond(0.002),
+        close_conditions=sl,
+    ))
+
+    # Regime-gated Dual
+    results.append(backtest(
+        df_slim, f"Regime_{method}_D",
+        buy_cond=RegimeLongCond(
+            ReversalLongCond(prox, decel, velocity_ceil=v_ceil)),
+        sell_cond=NearResistanceCond(0.002),
+        short_cond=RegimeShortCond(
+            ReversalShortCond(prox, decel, velocity_floor=v_floor)),
+        cover_cond=NearSupportCond(0.002),
+        close_conditions=sl,
+    ))
+
+    # Regime-gated Long only
+    results.append(backtest(
+        df_slim, f"Regime_{method}_L",
+        buy_cond=RegimeLongCond(
+            ReversalLongCond(prox, decel, velocity_ceil=v_ceil)),
+        sell_cond=NearResistanceCond(0.002),
+        close_conditions=sl,
+    ))
+
+    # Regime-gated Short only
+    results.append(backtest(
+        df_slim, f"Regime_{method}_S",
+        buy_cond=lambda row: False,
+        sell_cond=lambda row: False,
+        short_cond=RegimeShortCond(
+            ReversalShortCond(prox, decel, velocity_floor=v_floor)),
+        cover_cond=NearSupportCond(0.002),
+        close_conditions=sl,
+    ))
+
+    return results, bh_ret, bh_1y
+
+
+def run_regime_optimization_15m(df, method: str = "supertrend"):
+    """
+    Walk-forward optimisation of regime-gated S/R Baseline_15m.
+
+    Grid: regime params × S/R params
+      supertrend: period=[7,10,14], multiplier=[2.0,3.0,4.0]
+      S/R       : proximity=[0.003,0.007], decel=[0.5,1.5]
+
+    Train: 2022-01-01~2025-05-31  Val: 2025-06-01~present
+    """
+    TRAIN_START = "2022-01-01"
+    TRAIN_END   = "2025-05-31"
+    VAL_START   = "2025-06-01"
+
+    b    = BASELINE_15M
+    cgap = b["cluster_gap_pct"]
+    vp_w = b.get("vp_windows")
+    vb   = b["velocity_bars"]
+    fvb  = b["fast_velocity_bars"]
+    sl   = BASELINE_15M_SL
+
+    # Regime param grids per method
+    regime_grids = {
+        "supertrend": [
+            {"period": p, "multiplier": m}
+            for p in [7, 10, 14]
+            for m in [2.0, 3.0, 4.0]
+        ],
+        "ma200":     [{"window": w} for w in [100, 200]],
+        "ma_cross":  [{"fast": f, "slow": s}
+                      for f, s in [(20, 100), (50, 200)]],
+        "momentum":  [{"lookback": lb} for lb in [30, 60, 90]],
+    }
+    rg = regime_grids.get(method, [{}])
+
+    prox_list  = [0.003, 0.005, 0.007]
+    decel_list = [0.5, 1.0, 1.5]
+
+    print(f"  Building S/R levels...", flush=True)
+    df_base = df[df["date"] >= TRAIN_START].reset_index(drop=True).copy()
+    df_base.attrs = df.attrs.copy()
+    df_sr = add_sr_levels(df_base, vp_windows=vp_w, cluster_gap_pct=cgap)
+    df_sr.attrs = df_base.attrs.copy()
+
+    df_train_sr = df_sr[df_sr["date"] <= TRAIN_END].reset_index(drop=True)
+    df_train_sr.attrs = df_sr.attrs.copy()
+    df_val_sr   = df_sr[df_sr["date"] >= VAL_START].reset_index(drop=True)
+    df_val_sr.attrs = df_sr.attrs.copy()
+
+    bh_train = (df_train_sr["close"].iloc[-1] / df_train_sr["close"].iloc[0] - 1) * 100
+    bh_val   = (df_val_sr["close"].iloc[-1]   / df_val_sr["close"].iloc[0]   - 1) * 100
+
+    df_m      = add_momentum_indicators(df_sr.copy(), velocity_bars=vb,
+                                        fast_velocity_bars=fvb)
+    df_slim   = _slim_df(df_m)
+    df_slim_t = df_slim[df_slim["date"] <= TRAIN_END].reset_index(drop=True)
+    df_slim_t.attrs = df_slim.attrs.copy()
+    df_slim_v = df_slim[df_slim["date"] >= VAL_START].reset_index(drop=True)
+    df_slim_v.attrs = df_slim.attrs.copy()
+
+    total = len(rg) * len(prox_list) * len(decel_list)
+    print(f"  Phase 1: {total} Dual combos  "
+          f"train {TRAIN_START}~{TRAIN_END} / val {VAL_START}~present",
+          flush=True)
+    print(f"  BH train={bh_train:+.1f}%  val={bh_val:+.1f}%")
+
+    train_results = []
+    count = 0
+
+    # Pre-compute daily regimes for each regime param set (on full df)
+    daily_ohlcv = resample_to_daily(df_slim, date_col="date")
+    regime_cache = {}
+    for rp in rg:
+        key = tuple(sorted(rp.items()))
+        if key not in regime_cache:
+            regime_cache[key] = compute_regime(daily_ohlcv, method=method, **rp)
+
+    for rp in rg:
+        key = tuple(sorted(rp.items()))
+        regime_series = regime_cache[key]
+        regime_t = map_regime_to_bars(regime_series, df_slim_t,
+                                      date_col="date", shift_days=1)
+        regime_v = map_regime_to_bars(regime_series, df_slim_v,
+                                      date_col="date", shift_days=1)
+        df_t = df_slim_t.copy()
+        df_t["regime"] = regime_t
+        df_v = df_slim_v.copy()
+        df_v["regime"] = regime_v
+
+        rp_str = ",".join(f"{k}={v}" for k, v in rp.items())
+
+        for prox in prox_list:
+            for decel in decel_list:
+                tag = f"rg({rp_str})_px{prox*1000:.0f}_dc{decel}"
+                res_t = backtest(
+                    df_t, f"D_{tag}",
+                    buy_cond=RegimeLongCond(
+                        ReversalLongCond(prox, decel,
+                                        velocity_ceil=b["velocity_ceil_long"])),
+                    sell_cond=NearResistanceCond(0.002),
+                    short_cond=RegimeShortCond(
+                        ReversalShortCond(prox, decel,
+                                         velocity_floor=b["velocity_floor_short"])),
+                    cover_cond=NearSupportCond(0.002),
+                    close_conditions=sl,
+                )
+                train_results.append((rp, prox, decel, res_t))
+                count += 1
+                if count % max(1, total // 4) == 0 or count == total:
+                    print(f"  Phase 1: {count}/{total}", flush=True)
+
+    # Sort by train Sharpe
+    train_results.sort(key=lambda x: x[3]["sharpe"], reverse=True)
+    top15 = train_results[:15]
+
+    print(f"\n  Phase 2: validating top-15 Dual configs...", flush=True)
+    val_results = []
+    for rp, prox, decel, res_t in top15:
+        key = tuple(sorted(rp.items()))
+        regime_v = map_regime_to_bars(regime_cache[key], df_slim_v,
+                                      date_col="date", shift_days=1)
+        df_v = df_slim_v.copy()
+        df_v["regime"] = regime_v
+
+        rp_str = ",".join(f"{k}={v}" for k, v in rp.items())
+        tag    = f"rg({rp_str})_px{prox*1000:.0f}_dc{decel}"
+        res_v  = backtest(
+            df_v, f"D_{tag}",
+            buy_cond=RegimeLongCond(
+                ReversalLongCond(prox, decel,
+                                 velocity_ceil=b["velocity_ceil_long"])),
+            sell_cond=NearResistanceCond(0.002),
+            short_cond=RegimeShortCond(
+                ReversalShortCond(prox, decel,
+                                  velocity_floor=b["velocity_floor_short"])),
+            cover_cond=NearSupportCond(0.002),
+            close_conditions=sl,
+        )
+        val_results.append((rp, prox, decel, res_t, res_v))
+
+    # Print results table
+    _hdr = (f"\n{'':=<120}\n"
+            f"  REGIME-{method.upper()} Dual — Top-15 by train Sharpe (validated)"
+            f"   BH train={bh_train:+.1f}%  val={bh_val:+.1f}%\n"
+            f"{'':=<120}")
+    print(_hdr)
+    _col = (f"  {'regime_params':<30} {'px':>4} {'dc':>4}  "
+            f"{'TrRet':>7} {'TrShr':>6} {'TrMDD':>7} {'TrN':>5}  "
+            f"{'VaRet':>7} {'VaShr':>6} {'VaMDD':>7} {'VaN':>5}")
+    print(_col)
+    print(f"  {'-'*118}")
+
+    val_results_sorted_val = sorted(val_results, key=lambda x: x[4]["sharpe"], reverse=True)
+    for rp, prox, decel, res_t, res_v in val_results:
+        star = "*" if res_v["sharpe"] > 0.5 else " "
+        rp_str = ",".join(f"{k}={v}" for k, v in rp.items())
+        print(
+            f"  {star} {rp_str:<30} {prox*1000:>4.0f} {decel:>4.1f}  "
+            f"{res_t['total_return']:>7.1f}% {res_t['sharpe']:>6.3f} "
+            f"{res_t['max_drawdown']:>7.1f}% {res_t['trades']:>5}  "
+            f"{res_v['total_return']:>7.1f}% {res_v['sharpe']:>6.3f} "
+            f"{res_v['max_drawdown']:>7.1f}% {res_v['trades']:>5}"
+        )
+
+    print(f"\n{'':=<120}")
+    print(f"  REGIME-{method.upper()} — Same configs sorted by VAL Sharpe"
+          f"   BH train={bh_train:+.1f}%  val={bh_val:+.1f}%")
+    print(f"{'':=<120}")
+    print(_col)
+    print(f"  {'-'*118}")
+    for rp, prox, decel, res_t, res_v in val_results_sorted_val:
+        star = "*" if res_v["sharpe"] > 0.5 else " "
+        rp_str = ",".join(f"{k}={v}" for k, v in rp.items())
+        print(
+            f"  {star} {rp_str:<30} {prox*1000:>4.0f} {decel:>4.1f}  "
+            f"{res_t['total_return']:>7.1f}% {res_t['sharpe']:>6.3f} "
+            f"{res_t['max_drawdown']:>7.1f}% {res_t['trades']:>5}  "
+            f"{res_v['total_return']:>7.1f}% {res_v['sharpe']:>6.3f} "
+            f"{res_v['max_drawdown']:>7.1f}% {res_v['trades']:>5}"
+        )
+
+
 def run_vol_baseline(df):
     """Run volume-clock baseline on full history (2021-present)."""
     b = VOL_BASELINE
@@ -1780,6 +2450,7 @@ def main():
     mode_15m = "--15m" in sys.argv
     optimize_mode = "--optimize" in sys.argv
     sl_mode = "--sl" in sys.argv
+    sl_opt_mode = "--sl-opt" in sys.argv
     filter_mode = "--filter" in sys.argv
     velocity_mode = "--velocity" in sys.argv
     fast_mode = "--fast" in sys.argv
@@ -1787,6 +2458,76 @@ def main():
     wbottom_mode = "--wbottom" in sys.argv
     sensitivity_mode = "--sensitivity" in sys.argv
     volbaseline_mode = "--volbaseline" in sys.argv
+    regime_mode = "--regime" in sys.argv
+
+    if sl_opt_mode:
+        print("\n===== STOP-LOSS WALK-FORWARD OPTIMISATION (1h Baseline) =====")
+        print(f"  Train: 2021-01-01 ~ 2025-05-31  /  Val: 2025-06-01 ~ present")
+        df = load_data(
+            start="2020-01-01",
+            include_fg=False,
+            include_derivatives=False,
+            include_cb_premium=False,
+            interval="1h",
+        )
+        run_sl_optimization(df)
+        return
+
+    if regime_mode:
+        # Regime-filtered S/R Baseline (15m), daily Supertrend gating
+        # Usage: python strategy_test_sr_momentum.py --regime [--optimize] [method=supertrend]
+        method = "supertrend"
+        for arg in sys.argv:
+            if arg.startswith("method="):
+                method = arg.split("=", 1)[1]
+
+        interval = "15m" if mode_15m else "1h"
+        print(f"\n===== TREND REGIME BASELINE ({interval}, method={method}) =====")
+        df = load_data(
+            start="2020-01-01",
+            include_fg=False,
+            include_derivatives=False,
+            include_cb_premium=False,
+            interval=interval,
+        )
+
+        # Default: 1h regime baseline
+        # Use --15m to run 15m version instead
+        if mode_15m:
+            print("  (15m mode)")
+            regime_results, bh_ret, bh_1y = run_regime_baseline_15m(df, method=method)
+            bpd = 96
+        else:
+            print("  (1h mode)")
+            # Reload with 1h interval
+            df1h = load_data(
+                start="2020-01-01",
+                include_fg=False,
+                include_derivatives=False,
+                include_cb_premium=False,
+                interval="1h",
+            )
+            regime_results, bh_ret, bh_1y = run_regime_baseline(df1h, method=method)
+            bpd = 24
+
+        print_results(regime_results, buy_and_hold_ret=bh_ret,
+                      buy_and_hold_1y=bh_1y)
+        for res in regime_results:
+            print_yearly_breakdown(res, bars_per_day=bpd)
+
+        if optimize_mode:
+            print(f"\n===== REGIME WALK-FORWARD OPTIMISATION =====")
+            if mode_15m:
+                run_regime_optimization_15m(df, method=method)
+
+        save_results_to_files(
+            [r for r in regime_results if r["trades"] > 0],
+            summary_path="results_regime_summary.txt",
+            trade_log_path="trade_logs_regime.txt",
+            buy_and_hold_ret=bh_ret,
+            buy_and_hold_1y=bh_1y,
+        )
+        return
 
     if volbaseline_mode:
         # Volume-clock S/R strategy: 1h data, train 2021-2025.6, val 2025.6+
